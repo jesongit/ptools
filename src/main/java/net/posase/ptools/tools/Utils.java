@@ -1,77 +1,35 @@
 package net.posase.ptools.tools;
 
+import net.posase.ptools.downloader.Downloader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.File;
-import java.io.IOException;
-import java.net.ConnectException;
-import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Paths;
 
 public class Utils {
 
-    private final int MIN_SIZE = 2 << 20; // 多线程下载的最小大小
+    private final static Logger logger = LoggerFactory.getLogger(Utils.class);
+    public static File download_file(String path, String link) {
+        try{
+            File file = new File(path);
+            if(file.exists())
+                Files.delete(Paths.get(path));
 
-    Logger logger = LoggerFactory.getLogger(getClass());
-
-
-    public static void get(URL url, int thread_num = 8) throws IOException {
-        long startTime = System.currentTimeMillis();
-
-        int fileSize = getFileSize(url);
-        boolean muldownload = thread_num > 0 && fileSize > 0 && fileSize > MIN_SIZE;
-        fileSize = Math.abs(fileSize);
-
-        AtomicInteger downloadSize = new AtomicInteger(0);
-        AtomicInteger aliveThreads = new AtomicInteger(0);
-
-
-        if (!resumable || THREAD_NUM == 1|| fileSize < MIN_SIZE) multithreaded = false;
-        if (!multithreaded) {
-            new DownloadThread(0, 0, fileSize - 1).start();;
-        }
-        else {
-            endPoint = new int[THREAD_NUM + 1];
-            int block = fileSize / THREAD_NUM;
-            for (int i = 0; i < THREAD_NUM; i++) {
-                endPoint[i] = block * i;
-            }
-            endPoint[THREAD_NUM] = fileSize;
-            for (int i = 0; i < THREAD_NUM; i++) {
-                new DownloadThread(i, endPoint[i], endPoint[i + 1] - 1).start();
-            }
-        }
-
-        startDownloadMonitor();
-
-        //等待 downloadMonitor 通知下载完成
-        try {
-            synchronized(waiting) {
-                waiting.wait();
-            }
-        } catch (InterruptedException e) {
-            System.err.println("Download interrupted.");
-        }
-
-        cleanTempFile();
-
-        long timeElapsed = System.currentTimeMillis() - startTime;
-        System.out.println("* File successfully downloaded.");
-        System.out.println(String.format("* Time used: %.3f s, Average speed: %d KB/s",
-                timeElapsed / 1000.0, downloadedBytes.get() / timeElapsed));
-    }
-
-    public static File download_file(File file, String link) {
-
-        if(file.exists())
-            return file;
-
-        try {
-            // todo download file and save to file
+            Downloader downloader = Downloader.getInstance();
+            downloader.start(new URL(link), file);
             return file;
         } catch(Exception e){
+            logger.info(String.format("download fail path: %s link: %s", path, link), e.getMessage());
             return null;
         }
+    }
+
+    public static void main(String[] args) {
+        String link = "https://mirrors.tuna.tsinghua.edu.cn/centos/7.9.2009/isos/x86_64/CentOS-7-x86_64-DVD-2009.iso";
+        File file = Utils.download_file("./test.msi", link);
+        System.out.println(file);
     }
 }
