@@ -1,6 +1,6 @@
-package net.posase.ptools.tools;
+package net.posase.ptools.common.tools;
 
-import net.posase.ptools.downloader.Downloader;
+import net.posase.ptools.common.downloader.Downloader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

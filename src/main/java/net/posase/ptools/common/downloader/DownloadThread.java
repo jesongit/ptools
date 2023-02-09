@@ -1,4 +1,4 @@
-package net.posase.ptools.downloader;
+package net.posase.ptools.common.downloader;
 
 import lombok.Data;
 import lombok.EqualsAndHashCode;
@@ -10,9 +10,6 @@ import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import static net.posase.ptools.downloader.DownloadTask.BLOCK_SIZE;
-import static net.posase.ptools.downloader.DownloadTask.RETRY_CNT;
 
 @Data
 @EqualsAndHashCode(callSuper = true)
@@ -62,7 +59,7 @@ public class DownloadThread extends Thread{
             if (partSize != end - start + 1) return false;
 
             try (InputStream in = con.getInputStream()) {
-                byte[] buffer = new byte[BLOCK_SIZE];
+                byte[] buffer = new byte[DownloadTask.BLOCK_SIZE];
                 int size;
                 while (start <= end && (size = in.read(buffer)) > 0) {
                     start += size;
@@ -77,7 +74,7 @@ public class DownloadThread extends Thread{
         } catch (Exception e) {
             logger.info(String.format("Part %d", uid + 1), e.getMessage());
         }
-        if(tryCount < RETRY_CNT)
+        if(tryCount < DownloadTask.RETRY_CNT)
             downloadRange(tryCount + 1);
         return false;
     }

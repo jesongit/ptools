@@ -1,4 +1,4 @@
-package net.posase.ptools.downloader;
+package net.posase.ptools.common.downloader;
 
 import lombok.Data;
 import lombok.NonNull;
