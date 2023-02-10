@@ -11,13 +11,10 @@ spring:
       password:
       timeout: 3000ms
 
-springdoc:
-  swagger-ui:
-    path: /api
-  writer-with-default-pretty-printer: true
-  packages-to-scan: net.posase.ptools.modules.ums
-
 logging:
   level:
     root: info
-    com.macro.mall: debug
+    net.posase.ptools: debug
+
+sa-token:
+  is-log: true

@@ -18,7 +18,7 @@ public class DownloadThread extends Thread{
     Logger logger = LoggerFactory.getLogger(getClass());
     private final static int TIMEOUT = 5000;
 
-    @NonNull private DownloadTask task;
+    @NonNull private Downloader task;
     @NonNull private int uid;
     @NonNull private long start, end;
 
@@ -59,7 +59,7 @@ public class DownloadThread extends Thread{
             if (partSize != end - start + 1) return false;
 
             try (InputStream in = con.getInputStream()) {
-                byte[] buffer = new byte[DownloadTask.BLOCK_SIZE];
+                byte[] buffer = new byte[Downloader.BLOCK_SIZE];
                 int size;
                 while (start <= end && (size = in.read(buffer)) > 0) {
                     start += size;
@@ -74,7 +74,7 @@ public class DownloadThread extends Thread{
         } catch (Exception e) {
             logger.info(String.format("Part %d", uid + 1), e.getMessage());
         }
-        if(tryCount < DownloadTask.RETRY_CNT)
+        if(tryCount < Downloader.RETRY_CNT)
             downloadRange(tryCount + 1);
         return false;
     }

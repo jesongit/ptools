@@ -2,7 +2,7 @@ package net.posase.ptools.modules.ums.service.impl;
 
 import net.posase.ptools.modules.ums.entity.Menu;
 import net.posase.ptools.modules.ums.mapper.MenuMapper;
-import net.posase.ptools.modules.ums.service.IMenuService;
+import net.posase.ptools.modules.ums.service.MenuService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import org.springframework.stereotype.Service;
 
@@ -15,6 +15,6 @@ import org.springframework.stereotype.Service;
  * @since 2023-02-09
  */
 @Service
-public class MenuServiceImpl extends ServiceImpl<MenuMapper, Menu> implements IMenuService {
+public class MenuServiceImpl extends ServiceImpl<MenuMapper, Menu> implements MenuService {
 
 }

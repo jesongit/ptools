@@ -12,7 +12,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_role_resource_relation")
 @Schema(name = "RoleResourceRelation", description = "$!{table.comment}")
@@ -20,8 +20,8 @@ public class RoleResourceRelation implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    @TableId(value = "id", type = IdType.AUTO)
-    private Long id;
+    @TableId(value = "uid", type = IdType.AUTO)
+    private Long uid;
 
     @Schema(description = "角色ID")
     private Long roleId;
@@ -29,12 +29,12 @@ public class RoleResourceRelation implements Serializable {
     @Schema(description = "资源ID")
     private Long resourceId;
 
-    public Long getId() {
-        return id;
+    public Long getUid() {
+        return uid;
     }
 
-    public void setId(Long id) {
-        this.id = id;
+    public void setUid(Long uid) {
+        this.uid = uid;
     }
 
     public Long getRoleId() {
@@ -56,7 +56,7 @@ public class RoleResourceRelation implements Serializable {
     @Override
     public String toString() {
         return "RoleResourceRelation{" +
-            "id = " + id +
+            "uid = " + uid +
             ", roleId = " + roleId +
             ", resourceId = " + resourceId +
         "}";

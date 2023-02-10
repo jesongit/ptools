@@ -1,6 +1,8 @@
 package net.posase.ptools.modules.ums.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.io.Serializable;
@@ -13,7 +15,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_admin")
 @Schema(name = "Admin", description = "$!{table.comment}")
@@ -21,11 +23,14 @@ public class Admin implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
+    @Schema(description = "用户id")
     @TableId(value = "id", type = IdType.AUTO)
     private Long id;
 
+    @Schema(description = "用户名")
     private String username;
 
+    @Schema(description = "密码")
     private String password;
 
     @Schema(description = "头像")
@@ -41,6 +46,7 @@ public class Admin implements Serializable {
     private String note;
 
     @Schema(description = "创建时间")
+    @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     @Schema(description = "最后登录时间")

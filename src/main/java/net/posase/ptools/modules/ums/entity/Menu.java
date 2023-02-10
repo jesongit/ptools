@@ -1,6 +1,8 @@
 package net.posase.ptools.modules.ums.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.io.Serializable;
@@ -13,7 +15,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_menu")
 @Schema(name = "Menu", description = "$!{table.comment}")
@@ -28,6 +30,7 @@ public class Menu implements Serializable {
     private Long parentId;
 
     @Schema(description = "创建时间")
+    @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     @Schema(description = "菜单名称")

@@ -2,7 +2,7 @@ package net.posase.ptools.modules.ums.service.impl;
 
 import net.posase.ptools.modules.ums.entity.ResourceCategory;
 import net.posase.ptools.modules.ums.mapper.ResourceCategoryMapper;
-import net.posase.ptools.modules.ums.service.IResourceCategoryService;
+import net.posase.ptools.modules.ums.service.ResourceCategoryService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import org.springframework.stereotype.Service;
 
@@ -15,6 +15,6 @@ import org.springframework.stereotype.Service;
  * @since 2023-02-09
  */
 @Service
-public class ResourceCategoryServiceImpl extends ServiceImpl<ResourceCategoryMapper, ResourceCategory> implements IResourceCategoryService {
+public class ResourceCategoryServiceImpl extends ServiceImpl<ResourceCategoryMapper, ResourceCategory> implements ResourceCategoryService {
 
 }

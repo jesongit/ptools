@@ -2,6 +2,10 @@ package net.posase.ptools.modules.ums.mapper;
 
 import net.posase.ptools.modules.ums.entity.Admin;
 import com.baomidou.mybatisplus.core.mapper.BaseMapper;
+import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Select;
+
+import java.util.List;
 
 /**
  * <p>
@@ -13,4 +17,6 @@ import com.baomidou.mybatisplus.core.mapper.BaseMapper;
  */
 public interface AdminMapper extends BaseMapper<Admin> {
 
+    @Select("select * from ums_admin where `username`='${name}'")
+    List<Admin> selectByUsername(@Param("name") String name);
 }

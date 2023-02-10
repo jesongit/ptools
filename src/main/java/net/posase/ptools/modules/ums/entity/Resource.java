@@ -1,6 +1,8 @@
 package net.posase.ptools.modules.ums.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.io.Serializable;
@@ -13,7 +15,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_resource")
 @Schema(name = "Resource", description = "$!{table.comment}")
@@ -21,10 +23,11 @@ public class Resource implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    @TableId(value = "id", type = IdType.AUTO)
-    private Long id;
+    @TableId(value = "uid", type = IdType.AUTO)
+    private Long uid;
 
     @Schema(description = "创建时间")
+    @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     @Schema(description = "资源名称")
@@ -39,12 +42,12 @@ public class Resource implements Serializable {
     @Schema(description = "资源分类ID")
     private Long categoryId;
 
-    public Long getId() {
-        return id;
+    public Long getUid() {
+        return uid;
     }
 
-    public void setId(Long id) {
-        this.id = id;
+    public void setUid(Long uid) {
+        this.uid = uid;
     }
 
     public LocalDateTime getCreateTime() {
@@ -90,7 +93,7 @@ public class Resource implements Serializable {
     @Override
     public String toString() {
         return "Resource{" +
-            "id = " + id +
+            "uid = " + uid +
             ", createTime = " + createTime +
             ", name = " + name +
             ", url = " + url +

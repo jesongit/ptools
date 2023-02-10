@@ -1,6 +1,8 @@
 package net.posase.ptools.modules.ums.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.io.Serializable;
@@ -13,7 +15,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_role")
 @Schema(name = "Role", description = "$!{table.comment}")
@@ -21,8 +23,8 @@ public class Role implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    @TableId(value = "id", type = IdType.AUTO)
-    private Long id;
+    @TableId(value = "uid", type = IdType.AUTO)
+    private Long uid;
 
     @Schema(description = "名称")
     private String name;
@@ -34,19 +36,21 @@ public class Role implements Serializable {
     private Integer adminCount;
 
     @Schema(description = "创建时间")
+    @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
     @Schema(description = "启用状态：0->禁用；1->启用")
     private Integer status;
 
+    @Schema(description = "排序")
     private Integer sort;
 
-    public Long getId() {
-        return id;
+    public Long getUid() {
+        return uid;
     }
 
-    public void setId(Long id) {
-        this.id = id;
+    public void setUid(Long uid) {
+        this.uid = uid;
     }
 
     public String getName() {
@@ -100,7 +104,7 @@ public class Role implements Serializable {
     @Override
     public String toString() {
         return "Role{" +
-            "id = " + id +
+            "uid = " + uid +
             ", name = " + name +
             ", description = " + description +
             ", adminCount = " + adminCount +

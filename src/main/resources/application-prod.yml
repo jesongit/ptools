@@ -5,15 +5,15 @@ spring:
     password: Jeson@123
   data:
     redis:
-      host: redis
+      host: localhost
       database: 0
-      timeout: 3000ms
-      password:
       port: 6379
+      password:
+      timeout: 3000ms
 
 logging:
   file:
     path: /var/logs
   level:
     root: info
-    com.macro.mall: info
+    net.posase.ptools: info

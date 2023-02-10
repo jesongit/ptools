@@ -1,6 +1,8 @@
 package net.posase.ptools.modules.ums.entity;
 
+import com.baomidou.mybatisplus.annotation.FieldFill;
 import com.baomidou.mybatisplus.annotation.IdType;
+import com.baomidou.mybatisplus.annotation.TableField;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
 import java.io.Serializable;
@@ -13,7 +15,7 @@ import io.swagger.v3.oas.annotations.media.Schema;
  * </p>
  *
  * @author posase
- * @since 2023-02-09
+ * @since 2023-02-10
  */
 @TableName("ums_admin_login_log")
 @Schema(name = "AdminLoginLog", description = "$!{table.comment}")
@@ -21,19 +23,35 @@ public class AdminLoginLog implements Serializable {
 
     private static final long serialVersionUID = 1L;
 
-    @TableId(value = "id", type = IdType.AUTO)
+    @TableId(value = "uid", type = IdType.AUTO)
+    private Long uid;
+
+    @Schema(description = "用户id")
     private Long id;
 
-    private Long adminId;
-
+    @Schema(description = "创建时间")
+    @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 
+    @Schema(description = "ip 地址")
     private String ip;
 
+    @Schema(description = "地址")
     private String address;
 
     @Schema(description = "浏览器登录类型")
     private String userAgent;
+
+    @Schema(description = "状态码 1 成功 0 失败")
+    private Integer code;
+
+    public Long getUid() {
+        return uid;
+    }
+
+    public void setUid(Long uid) {
+        this.uid = uid;
+    }
 
     public Long getId() {
         return id;
@@ -41,14 +59,6 @@ public class AdminLoginLog implements Serializable {
 
     public void setId(Long id) {
         this.id = id;
-    }
-
-    public Long getAdminId() {
-        return adminId;
-    }
-
-    public void setAdminId(Long adminId) {
-        this.adminId = adminId;
     }
 
     public LocalDateTime getCreateTime() {
@@ -83,15 +93,24 @@ public class AdminLoginLog implements Serializable {
         this.userAgent = userAgent;
     }
 
+    public Integer getCode() {
+        return code;
+    }
+
+    public void setCode(Integer code) {
+        this.code = code;
+    }
+
     @Override
     public String toString() {
         return "AdminLoginLog{" +
-            "id = " + id +
-            ", adminId = " + adminId +
+            "uid = " + uid +
+            ", id = " + id +
             ", createTime = " + createTime +
             ", ip = " + ip +
             ", address = " + address +
             ", userAgent = " + userAgent +
+            ", code = " + code +
         "}";
     }
 }

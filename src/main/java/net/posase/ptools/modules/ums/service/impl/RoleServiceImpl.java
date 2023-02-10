@@ -2,7 +2,7 @@ package net.posase.ptools.modules.ums.service.impl;
 
 import net.posase.ptools.modules.ums.entity.Role;
 import net.posase.ptools.modules.ums.mapper.RoleMapper;
-import net.posase.ptools.modules.ums.service.IRoleService;
+import net.posase.ptools.modules.ums.service.RoleService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import org.springframework.stereotype.Service;
 
@@ -15,6 +15,6 @@ import org.springframework.stereotype.Service;
  * @since 2023-02-09
  */
 @Service
-public class RoleServiceImpl extends ServiceImpl<RoleMapper, Role> implements IRoleService {
+public class RoleServiceImpl extends ServiceImpl<RoleMapper, Role> implements RoleService {
 
 }
