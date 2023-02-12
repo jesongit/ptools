@@ -3,6 +3,7 @@ package net.posase.ptools.common.downloader;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.NonNull;
+import lombok.RequiredArgsConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -15,8 +16,8 @@ import java.nio.file.Paths;
 import java.util.concurrent.atomic.AtomicInteger;
 
 @Data
-@NoArgsConstructor
-public class Downloader implements DownloadCallBack {
+@RequiredArgsConstructor
+public class Downloader{
 
     Logger logger = LoggerFactory.getLogger(getClass());
     private final static int MIN_SIZE = 2 << 18, THREAD_NUM = 8, TIMEOUT = 5000;
@@ -32,14 +33,21 @@ public class Downloader implements DownloadCallBack {
 
     private final Object display = new Object();
 
+    @NonNull private DownloadCallBack callBack;
+
     public Downloader(URL url, File file) {
-        this.url = url;
-        this.file = file;
+        this(url, file, new DownloadCallBack() {
+            @Override
+            public void before_download(File file) {}
+
+            @Override
+            public void finish_download(File file) {}
+        });
     }
 
     public void download() {
 
-        before_download();
+        callBack.before_download(file);
 
         startTime = System.currentTimeMillis();
 
@@ -113,7 +121,7 @@ public class Downloader implements DownloadCallBack {
                 MergeTime: %.3f s
                 """, file.getAbsolutePath(), fileSize, useTime / 1000, fileSize / useTime, mergeTime));
 
-            finish_download();
+            callBack.finish_download(file);
         });
 
         merge.setDaemon(true);
@@ -180,15 +188,5 @@ public class Downloader implements DownloadCallBack {
         } catch (IOException e) {
             logger.info(String.format("merge file fail multiDownload %b", multiDownload), e.getMessage());
         }
-    }
-
-    @Override
-    public void before_download() {
-
-    }
-
-    @Override
-    public void finish_download() {
-
     }
 }

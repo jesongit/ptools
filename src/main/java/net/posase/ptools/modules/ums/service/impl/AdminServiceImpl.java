@@ -1,12 +1,11 @@
 package net.posase.ptools.modules.ums.service.impl;
 
 import cn.dev33.satoken.stp.StpUtil;
-import net.posase.ptools.common.exception.ErrorCode;
+import net.posase.ptools.common.enums.ErrorCode;
 import net.posase.ptools.common.tools.Utils;
 import net.posase.ptools.modules.ums.dto.UserInfoDto;
 import net.posase.ptools.modules.ums.dto.UserLoginDto;
 import net.posase.ptools.modules.ums.entity.Admin;
-import net.posase.ptools.modules.ums.entity.AdminLoginLog;
 import net.posase.ptools.modules.ums.mapper.AdminLoginLogMapper;
 import net.posase.ptools.modules.ums.mapper.AdminMapper;
 import net.posase.ptools.modules.ums.service.AdminService;

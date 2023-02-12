@@ -1,4 +1,4 @@
-package net.posase.ptools.common.exception;
+package net.posase.ptools.common.enums;
 
 import lombok.AllArgsConstructor;
 import lombok.Getter;
@@ -12,6 +12,7 @@ public enum ErrorCode {
     MV_VALID(2001, "MV不存在"),
 
     PATH_VALID(9001, "路径错误"),
+    URL_VALID(9002, "URL访问失败"),
     ;
 
     private long code;

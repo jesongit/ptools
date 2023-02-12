@@ -14,5 +14,6 @@ import java.util.List;
  * @since 2023-02-10
  */
 public interface MvService extends IService<Mv> {
-    void download(List<String> uuid, String path);
+
+    void download(List<String> uuidList, String path);
 }

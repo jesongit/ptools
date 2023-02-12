@@ -1,6 +1,9 @@
 package net.posase.ptools.modules.tms.service.impl;
 
-import net.posase.ptools.common.exception.ErrorCode;
+import net.posase.ptools.common.downloader.Downloader;
+import net.posase.ptools.common.downloader.MvCallBack;
+import net.posase.ptools.common.enums.ErrorCode;
+import net.posase.ptools.common.exception.ApiException;
 import net.posase.ptools.common.tools.Utils;
 import net.posase.ptools.modules.tms.entity.Mv;
 import net.posase.ptools.modules.tms.mapper.MvMapper;
@@ -9,6 +12,8 @@ import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import org.springframework.stereotype.Service;
 
 import java.io.File;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.util.List;
 
 /**
@@ -23,15 +28,21 @@ import java.util.List;
 public class MvServiceImpl extends ServiceImpl<MvMapper, Mv> implements MvService {
 
     @Override
-    public void download(List<String> uuid_list, String path) {
-        List<Mv> list = baseMapper.selectBatchIds(uuid_list);
-        Utils.iAssert(list.size() > 0, ErrorCode.MV_VALID);
+    public void download(List<String> uuidList, String path) {
+        List<Mv> mvList = baseMapper.selectBatchIds(uuidList);
+        Utils.iAssert(mvList.size() > 0, ErrorCode.MV_VALID);
 
         File dir = new File(path);
-        Utils.iAssert(dir.isDirectory() && dir.exists(), ErrorCode.PATH_VALID);
+        Utils.iAssert(dir.exists() && dir.isDirectory(), ErrorCode.PATH_VALID);
 
-        list.forEach(mv -> {
-            // todo
-        });
+        for (Mv mv : mvList) {
+            try {
+                File file = new File(path + mv.getName());
+                URL url = new URL(mv.getDownloadLink());
+                new Downloader(url, file, new MvCallBack(mv));
+            } catch (MalformedURLException e) {
+                throw new ApiException(ErrorCode.URL_VALID);
+            }
+        }
     }
 }

@@ -32,7 +32,6 @@ public class MvController {
 
     @RequestMapping(value = "insert", method = RequestMethod.POST)
     public SaResult insert(@Validated @RequestBody Mv mv) {
-        mv.setUuid(null);       // 保证uuid 自动生成
         mvService.save(mv);
         return SaResult.data(mv);
     }
@@ -53,6 +52,11 @@ public class MvController {
     public SaResult download(@RequestParam("uuid_list") List<String> uuid_list,
                              @RequestParam("path") String path) {
         mvService.download(uuid_list, path);
+        return SaResult.ok();
+    }
+
+    @RequestMapping(value = "deal", method = RequestMethod.POST)
+    public SaResult deal(@Validated @RequestBody Mv mv) {
         return SaResult.ok();
     }
 }

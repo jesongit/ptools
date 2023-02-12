@@ -9,6 +9,7 @@ import com.baomidou.mybatisplus.generator.IFill;
 import com.baomidou.mybatisplus.generator.config.OutputFile;
 import com.baomidou.mybatisplus.generator.config.po.LikeTable;
 import com.baomidou.mybatisplus.generator.config.po.TableField;
+import com.baomidou.mybatisplus.generator.config.rules.DateType;
 import com.baomidou.mybatisplus.generator.engine.FreemarkerTemplateEngine;
 import com.baomidou.mybatisplus.generator.fill.Property;
 import net.posase.ptools.common.tools.Utils;
@@ -87,7 +88,7 @@ class PtoolsApplicationTests {
                             .addTablePrefix(model + "_")  // 设置过滤表前缀
                             .addTableSuffix("_info")
                             .entityBuilder()            // entry 策略
-//                            .enableLombok()             // Lombok 模式 只会生成 Getter 和 Setter
+                            .enableLombok()             // Lombok 模式 只会生成 Getter 和 Setter
 //                            .addTableFills(new Column("gmt_create", FieldFill.INSERT)) //根据数据库字段名适配
 //                            .addTableFills(new Property("createTime", FieldFill.INSERT))//根据生成实体类的属性名适配
                             .addTableFills(tabFillList)

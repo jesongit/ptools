@@ -1,6 +1,7 @@
 package net.posase.ptools.common.exception;
 
 import lombok.Getter;
+import net.posase.ptools.common.enums.ErrorCode;
 
 @Getter
 public class ApiException extends RuntimeException {
