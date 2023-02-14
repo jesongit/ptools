@@ -42,11 +42,11 @@ public class MvController {
         return SaResult.ok();
     }
 
-    @RequestMapping(value = "update", method = RequestMethod.PUT)
-    public SaResult update(@Validated @RequestBody Mv mv) {
-        mvService.updateById(mv);
-        return SaResult.ok();
-    }
+//    @RequestMapping(value = "update", method = RequestMethod.PUT)
+//    public SaResult update(@Validated @RequestBody Mv mv_template) {
+//        mvService.updateById(mv_template);
+//        return SaResult.ok();
+//    }
 
     @RequestMapping(value = "download", method = RequestMethod.GET)
     public SaResult download(@RequestParam("uuid_list") List<String> uuid_list,
@@ -57,6 +57,7 @@ public class MvController {
 
     @RequestMapping(value = "deal", method = RequestMethod.POST)
     public SaResult deal(@Validated @RequestBody Mv mv) {
+        mvService.deal(mv);
         return SaResult.ok();
     }
 }

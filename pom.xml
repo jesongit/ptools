@@ -86,7 +86,7 @@
         <!--Mysql数据库驱动-->
         <dependency>
             <groupId>mysql</groupId>
-            <artifactId>mysql-connector-java</artifactId>
+            <artifactId>mysql-connector-j</artifactId>
             <version>${mysql-connector.version}</version>
         </dependency>
         <!-- MyBatis Plus -->
@@ -112,6 +112,18 @@
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>2.0.2</version>
+        </dependency>
+        <!-- MediaInfo -->
+        <dependency>
+          <groupId>com.abercap</groupId>
+          <artifactId>mediainfo-java-api</artifactId>
+          <version>1.0.0.RELEASE</version>
+        </dependency>
+        <!-- 缩略图工具 -->
+        <dependency>
+            <groupId>net.coobird</groupId>
+            <artifactId>thumbnailator</artifactId>
+            <version>0.4.19</version>
         </dependency>
     </dependencies>
 

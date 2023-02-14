@@ -1,0 +1,3 @@
+Video Codec..........: {video_codec}
+Frame Rate...........: {video.frame_rate}
+Resolution...........: {width} x {height}

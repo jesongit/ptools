@@ -1,9 +1,11 @@
 package net.posase.ptools.common.tools;
 
 import cn.dev33.satoken.secure.SaSecureUtil;
+import com.abercap.mediainfo.api.MediaInfo;
 import net.posase.ptools.common.downloader.Downloader;
 import net.posase.ptools.common.exception.ApiException;
 import net.posase.ptools.common.enums.ErrorCode;
+import net.posase.ptools.modules.tms.entity.Mv;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 

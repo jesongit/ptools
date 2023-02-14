@@ -13,6 +13,8 @@ public enum ErrorCode {
 
     PATH_VALID(9001, "路径错误"),
     URL_VALID(9002, "URL访问失败"),
+    RESOLUTION(9003, "分辨率错误"),
+    RENAME_ERR(9004, "重命名失败"),
     ;
 
     private long code;

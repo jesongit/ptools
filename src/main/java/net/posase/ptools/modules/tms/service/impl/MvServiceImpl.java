@@ -2,8 +2,10 @@ package net.posase.ptools.modules.tms.service.impl;
 
 import net.posase.ptools.common.downloader.Downloader;
 import net.posase.ptools.common.downloader.MvCallBack;
+import net.posase.ptools.common.enums.DealType;
 import net.posase.ptools.common.enums.ErrorCode;
 import net.posase.ptools.common.exception.ApiException;
+import net.posase.ptools.common.tools.Uploader;
 import net.posase.ptools.common.tools.Utils;
 import net.posase.ptools.modules.tms.entity.Mv;
 import net.posase.ptools.modules.tms.mapper.MvMapper;
@@ -44,5 +46,11 @@ public class MvServiceImpl extends ServiceImpl<MvMapper, Mv> implements MvServic
                 throw new ApiException(ErrorCode.URL_VALID);
             }
         }
+    }
+
+    @Override
+    public void deal(Mv mv) {
+        baseMapper.updateById(mv);
+        Uploader.deal_upload(mv, DealType.QMusic);
     }
 }
