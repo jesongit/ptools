@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "id": "applications",
+  "name": "应用启动",
+  "version": "0.1.0",
+  "description": "发现开始菜单、桌面快捷方式及系统应用，提供名称和拼音搜索。刷新完成后退出。",
+  "runtime": "executable",
+  "executable": "ptools-applications.exe"
+}
