@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "id": "capture",
+  "name": "截图与贴图",
+  "version": "0.1.0",
+  "description": "按需启动的原生截图、标注、贴图、离线识别、取色和二维码工具。图片历史默认保留7天。",
+  "runtime": "interactive",
+  "executable": "ptools-capture.exe",
+  "actions": [
+    {"id":"capture","title":"截图","keywords":["jt","screenshot"],"hotkey":"Ctrl+1"},
+    {"id":"pin","title":"贴图","subtitle":"贴出剪贴板中的图片、文字、文件或颜色","keywords":["tt","pin"],"hotkey":"Ctrl+2"},
+    {"id":"history","title":"图片历史","subtitle":"截图和贴图共用，默认保留7天","keywords":["history","ls"],"hotkey":"Ctrl+3"},
+    {"id":"custom","title":"延时与固定区域截图","keywords":["custom","ys"],"hotkey":"Alt+1"},
+    {"id":"settings","title":"截图插件设置","keywords":["capture settings"]},
+    {"id":"quick","title":"快速截图并贴图","subtitle":"按住 Win + 鼠标左键拖动，松开左键复制并贴图","keywords":["quick","快速截图"]}
+  ]
+}

@@ -18,6 +18,21 @@ pub struct Manifest {
     pub executable: Option<String>,
     #[serde(default)]
     pub entries: Vec<Entry>,
+    #[serde(default)]
+    pub actions: Vec<PluginAction>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginAction {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub hotkey: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -25,6 +40,7 @@ pub struct Manifest {
 pub enum Runtime {
     Config,
     Executable,
+    Interactive,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +61,7 @@ pub enum Target {
     Path { path: String },
     Url { url: String },
     App { app_id: String },
+    Plugin { action: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +92,8 @@ pub struct Settings {
     pub hotkey: String,
     pub disabled_plugins: BTreeSet<String>,
     pub usage: BTreeMap<String, Usage>,
+    #[serde(default)]
+    pub plugin_hotkeys: BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -83,6 +102,7 @@ impl Default for Settings {
             hotkey: "Alt+Space".into(),
             disabled_plugins: BTreeSet::new(),
             usage: BTreeMap::new(),
+            plugin_hotkeys: BTreeMap::new(),
         }
     }
 }
@@ -132,6 +152,17 @@ pub fn validate_entry(entry: &Entry) -> Result<()> {
                 return Err("无效的应用标识".into());
             }
             app_id
+        }
+        Target::Plugin { action } => {
+            if action.is_empty()
+                || action.len() > 64
+                || !action
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            {
+                return Err("无效的插件动作".into());
+            }
+            action
         }
     };
     if target.is_empty() || target.len() > 32760 || target.contains('\0') {

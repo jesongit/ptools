@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod gesture;
+mod interactive;
 mod ui;
 use ptools_core::*;
 use std::{fs, path::PathBuf};
@@ -47,6 +49,16 @@ fn run() -> Result<()> {
     let mut settings: Settings = read_json(&paths.settings())?;
     let mut cache: Cache = read_json(&paths.cache())?;
     let marker = paths.root.join("initialized");
+    for id in ["capture", "uninstaller"] {
+        let installed = paths.root.join(format!("initialized-{id}"));
+        let bundled = exe_dir.join("plugins").join(id);
+        if bundled.exists() && !installed.exists() {
+            if !paths.plugins.join(id).exists() {
+                install_plugin(&bundled, &paths.plugins)?;
+            }
+            fs::write(installed, b"1").map_err(|e| e.to_string())?;
+        }
+    }
     if !marker.exists() {
         let bundled = exe_dir.join("plugins/applications");
         if bundled.exists() && !paths.plugins.join("applications").exists() {

@@ -77,18 +77,54 @@ pub fn write_json<T: Serialize>(path: &Path, data: &T) -> Result<()> {
         };
         let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
         let to: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        if unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        } == 0
-        {
-            return Err(std::io::Error::last_os_error().to_string());
+        for attempt in 0..10 {
+            if unsafe {
+                MoveFileExW(
+                    from.as_ptr(),
+                    to.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            } != 0
+            {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if attempt == 9 || !matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+                let _ = fs::remove_file(&temp);
+                return Err(error.to_string());
+            }
+            // A reader or antivirus can briefly deny replacement while sharing reads.
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
     #[cfg(not(windows))]
     fs::rename(&temp, path).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use crate::now;
+    #[test]
+    fn atomic_replace_survives_a_short_lived_windows_reader() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("ptools-storage-{}-{}", std::process::id(), now()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("fixture.json");
+        write_json(&path, &vec!["old"]).unwrap();
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&path)
+            .unwrap();
+        let target = path.clone();
+        let writer = std::thread::spawn(move || write_json(&target, &vec!["new"]));
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        drop(reader);
+        writer.join().unwrap().unwrap();
+        assert_eq!(read_json::<Vec<String>>(&path).unwrap(), ["new"]);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

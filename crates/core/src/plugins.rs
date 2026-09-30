@@ -12,10 +12,10 @@ const MAX_RESPONSE: u64 = 8 * 1024 * 1024;
 const MAX_PACKAGE: u64 = 128 * 1024 * 1024;
 
 #[cfg(windows)]
-struct PluginJob(windows_sys::Win32::Foundation::HANDLE);
+pub struct PluginJob(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl PluginJob {
-    fn attach(child: &std::process::Child) -> Result<Self> {
+    pub fn attach(child: &std::process::Child) -> Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::*;
         unsafe {
@@ -118,7 +118,7 @@ pub fn load_plugin(directory: &Path) -> Result<Plugin> {
     }
     let manifest: Manifest = serde_json::from_slice(&fs::read(&file).map_err(|e| e.to_string())?)
         .map_err(|e| format!("{}: {e}", file.display()))?;
-    if manifest.schema_version != 1 {
+    if !matches!(manifest.schema_version, 1 | 2) {
         return Err("不支持的插件清单版本".into());
     }
     if manifest.id.is_empty()
@@ -134,7 +134,7 @@ pub fn load_plugin(directory: &Path) -> Result<Plugin> {
         return Err("插件名称或版本无效".into());
     }
     match manifest.runtime {
-        Runtime::Executable => {
+        Runtime::Executable | Runtime::Interactive => {
             let exe = safe_relative(
                 manifest
                     .executable
@@ -149,6 +149,14 @@ pub fn load_plugin(directory: &Path) -> Result<Plugin> {
         Runtime::Config => {
             validate_entries(&manifest.entries)?;
         }
+    }
+    if manifest.runtime == Runtime::Interactive {
+        if manifest.schema_version != 2 || manifest.actions.is_empty() {
+            return Err("交互插件需要 schema_version 2 和 actions".into());
+        }
+        validate_entries(&action_entries(&manifest))?;
+    } else if !manifest.actions.is_empty() {
+        return Err("只有交互插件可提供动作".into());
     }
     Ok(Plugin {
         manifest,
@@ -195,6 +203,13 @@ fn validate_entries(entries: &[Entry]) -> Result<()> {
 }
 
 pub fn run_index(plugin: &Plugin, timeout: Duration) -> Result<IndexResponse> {
+    if plugin.manifest.runtime == Runtime::Interactive {
+        return Ok(IndexResponse {
+            protocol_version: 1,
+            entries: action_entries(&plugin.manifest),
+            warnings: vec![],
+        });
+    }
     if plugin.manifest.runtime == Runtime::Config {
         return Ok(IndexResponse {
             protocol_version: 1,
@@ -304,6 +319,38 @@ pub fn run_index(plugin: &Plugin, timeout: Duration) -> Result<IndexResponse> {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn action_entries(manifest: &Manifest) -> Vec<Entry> {
+    manifest
+        .actions
+        .iter()
+        .map(|action| Entry {
+            id: action.id.clone(),
+            title: action.title.clone(),
+            subtitle: action.subtitle.clone(),
+            keywords: action.keywords.clone(),
+            target: Target::Plugin {
+                action: action.id.clone(),
+            },
+        })
+        .collect()
+}
+
+pub fn interactive_executable(plugin: &Plugin, action: &str) -> Result<PathBuf> {
+    if plugin.manifest.runtime != Runtime::Interactive
+        || !plugin.manifest.actions.iter().any(|a| a.id == action)
+    {
+        return Err("插件未声明这个动作".into());
+    }
+    plugin_file(
+        &plugin.directory,
+        plugin
+            .manifest
+            .executable
+            .as_deref()
+            .ok_or("缺少插件入口")?,
+    )
 }
 
 fn parse_response(bytes: &[u8]) -> Result<IndexResponse> {
@@ -571,6 +618,32 @@ mod tests {
         ] {
             assert!(plugin_file(&plugin, path).is_err(), "accepted {path}");
         }
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn interactive_index_never_executes_and_dispatch_requires_declared_action() {
+        let base = temp("interactive");
+        // Deliberately not an executable: indexing must come entirely from the manifest.
+        fs::write(base.join("tool.exe"), b"not a PE executable").unwrap();
+        let mut manifest = serde_json::json!({"schema_version":2,"id":"test","name":"test","version":"1","runtime":"interactive","executable":"tool.exe","actions":[{"id":"open","title":"Open","hotkey":"Ctrl+1"}]});
+        let file = base.join("plugin.json");
+        write_json(&file, &manifest).unwrap();
+        let plugin = load_plugin(&base).unwrap();
+        let indexed = run_index(&plugin, Duration::from_millis(1)).unwrap();
+        assert_eq!(indexed.entries.len(), 1);
+        assert!(
+            matches!(&indexed.entries[0].target, Target::Plugin { action } if action == "open")
+        );
+        assert!(interactive_executable(&plugin, "open").is_ok());
+        assert!(interactive_executable(&plugin, "undeclared").is_err());
+        manifest["actions"][0]["id"] = "../bad".into();
+        write_json(&file, &manifest).unwrap();
+        assert!(load_plugin(&base).is_err());
+        manifest["actions"][0]["id"] = "open".into();
+        manifest["schema_version"] = 1.into();
+        write_json(&file, &manifest).unwrap();
+        assert!(load_plugin(&base).is_err());
         fs::remove_dir_all(base).unwrap();
     }
 

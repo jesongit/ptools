@@ -1,0 +1,24 @@
+[package]
+name = "ptools-tools"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "ptools_tools"
+
+[[bin]]
+name = "ptools-capture"
+path = "src/bin/capture.rs"
+
+[[bin]]
+name = "ptools-uninstaller"
+path = "src/bin/uninstaller.rs"
+
+[dependencies]
+ptools-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rqrr = "0.10"
+windows = { version = "0.62.2", features = ["Foundation", "Globalization", "Media_Ocr", "Graphics_Imaging", "Security_Cryptography", "Storage_Streams", "Win32_System_Com", "Win32_UI_Accessibility", "Win32_Foundation", "Win32_System_Variant", "Win32_System_Ole"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_System_Com", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_ApplicationInstallationAndServicing", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Shell", "Win32_UI_HiDpi", "Win32_Networking_WinHttp", "Win32_Security", "Win32_Security_Credentials", "Win32_Storage_FileSystem"] }

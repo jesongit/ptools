@@ -35,12 +35,36 @@ const LIST_ID: usize = 202;
 const MENU_ID: usize = 203;
 const TIMER_SMOKE: usize = 301;
 const MAX_ICONS: usize = 64;
+// winresource::set_icon embeds the application icon with resource ID 1.
+const APPLICATION_ICON_ID: usize = 1;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 fn color(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+unsafe fn application_icon(small: bool) -> HICON {
+    let (width, height) = if small {
+        (SM_CXSMICON, SM_CYSMICON)
+    } else {
+        (SM_CXICON, SM_CYICON)
+    };
+    // Shared resource handles live for the process lifetime; do not DestroyIcon them.
+    let icon = LoadImageW(
+        GetModuleHandleW(null()),
+        APPLICATION_ICON_ID as *const u16,
+        IMAGE_ICON,
+        GetSystemMetrics(width),
+        GetSystemMetrics(height),
+        LR_SHARED,
+    ) as HICON;
+    if icon.is_null() {
+        LoadIconW(null_mut(), IDI_APPLICATION)
+    } else {
+        icon
+    }
 }
 
 #[derive(Clone)]
@@ -84,6 +108,9 @@ enum Event {
 }
 
 struct State {
+    gesture: Option<crate::gesture::Gesture>,
+    sessions: crate::interactive::Sessions,
+    plugin_hotkeys: HashMap<i32, (String, String)>,
     paths: Paths,
     settings: Settings,
     cache: Cache,
@@ -212,6 +239,9 @@ pub fn run(
         let (tx, rx) = mpsc::channel();
         let background = CreateSolidBrush(color(250, 251, 253));
         let mut app = Box::new(State {
+            gesture: None,
+            sessions: Default::default(),
+            plugin_hotkeys: HashMap::new(),
             paths,
             settings,
             cache,
@@ -257,7 +287,8 @@ pub fn run(
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
             hbrBackground: background,
             lpszClassName: class_name.as_ptr(),
-            hIcon: LoadIconW(null_mut(), IDI_APPLICATION),
+            hIcon: application_icon(false),
+            hIconSm: application_icon(true),
             ..zeroed()
         };
         if RegisterClassExW(&class) == 0 {
@@ -294,6 +325,7 @@ pub fn run(
             app.status = format!("{} 已被占用，请进入“设置”更换快捷键", app.settings.hotkey);
         }
         setup_tray(hwnd);
+        sync_plugin_hotkeys(hwnd);
         rebuild(hwnd);
         if !hidden || !app.hotkey_ok {
             show(hwnd);
@@ -332,6 +364,59 @@ unsafe fn register_hotkey(hwnd: HWND, name: &str) -> bool {
         _ => MOD_ALT,
     };
     RegisterHotKey(hwnd, HOTKEY_ID, modifiers | MOD_NOREPEAT, VK_SPACE as u32) != 0
+}
+
+unsafe fn sync_plugin_hotkeys(hwnd: HWND) {
+    let s = state(hwnd);
+    for (id, _) in (*s).plugin_hotkeys.drain() {
+        UnregisterHotKey(hwnd, id);
+    }
+    let (plugins, _) = discover_plugins(&(*s).paths.plugins);
+    let gesture_enabled = plugins.iter().any(|plugin| {
+        plugin.manifest.id == "capture"
+            && !(*s).settings.disabled_plugins.contains("capture")
+            && plugin
+                .manifest
+                .actions
+                .iter()
+                .any(|action| action.id == "quick")
+            && interactive_executable(plugin, "quick").is_ok()
+    });
+    if !gesture_enabled {
+        (*s).gesture = None;
+    } else if (*s).gesture.is_none() {
+        match crate::gesture::Gesture::start(hwnd) {
+            Ok(gesture) => (*s).gesture = Some(gesture),
+            Err(error) => (*s).status = error,
+        }
+    }
+    let mut id = 1000;
+    for plugin in plugins {
+        if (*s).settings.disabled_plugins.contains(&plugin.manifest.id) {
+            continue;
+        }
+        for action in &plugin.manifest.actions {
+            let key = format!("{}:{}", plugin.manifest.id, action.id);
+            let value = (*s)
+                .settings
+                .plugin_hotkeys
+                .get(&key)
+                .map(String::as_str)
+                .or(action.hotkey.as_deref());
+            if let Some(value) = value.filter(|s| !s.is_empty()) {
+                if let Some((mods, vk)) = crate::interactive::hotkey(value) {
+                    if RegisterHotKey(hwnd, id, mods, vk) != 0 {
+                        (*s).plugin_hotkeys
+                            .insert(id, (plugin.manifest.id.clone(), action.id.clone()));
+                    } else {
+                        (*s).status =
+                            format!("{} 的快捷键 {value} 被占用；仍可通过搜索打开", action.title);
+                    }
+                }
+                id += 1;
+            }
+        }
+    }
 }
 
 unsafe fn fonts(hwnd: HWND) {
@@ -379,7 +464,7 @@ unsafe fn setup_tray(hwnd: HWND) {
     tray.uID = 1;
     tray.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     tray.uCallbackMessage = WM_TRAY;
-    tray.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+    tray.hIcon = application_icon(true);
     let tip = wide(&format!("ptools · {}", (*s).settings.hotkey));
     tray.szTip[..tip.len().min(128)].copy_from_slice(&tip[..tip.len().min(128)]);
     Shell_NotifyIconW(NIM_ADD, &tray);
@@ -856,10 +941,21 @@ unsafe fn act(hwnd: HWND, action: Action) {
     let s = state(hwnd);
     match action {
         Action::Launch(item) => {
+            if let Target::Plugin { action } = &item.entry.target {
+                hide(hwnd, false);
+                if let Err(e) =
+                    (*s).sessions
+                        .invoke(&(*s).paths, &(*s).settings, &item.plugin_id, action)
+                {
+                    alert(hwnd, &e, false);
+                }
+                return;
+            }
             let target = match &item.entry.target {
                 Target::Path { path } => path.replace('/', "\\"),
                 Target::Url { url } => url.clone(),
                 Target::App { app_id } => format!("shell:AppsFolder\\{app_id}"),
+                Target::Plugin { .. } => unreachable!(),
             };
             // Hide before launch so focus loss from the launched application cannot restore a stale foreground window.
             hide(hwnd, false);
@@ -935,8 +1031,10 @@ unsafe fn act(hwnd: HWND, action: Action) {
                 return;
             }
             if !(*s).settings.disabled_plugins.remove(&id) {
+                (*s).sessions.stop(&id);
                 (*s).settings.disabled_plugins.insert(id);
             }
+            sync_plugin_hotkeys(hwnd);
             save_settings(hwnd);
             (*s).index = build_index(&(*s).cache, &(*s).settings);
             rebuild(hwnd);
@@ -998,6 +1096,7 @@ unsafe fn act(hwnd: HWND, action: Action) {
                 return;
             }
             (*s).busy = true;
+            (*s).sessions.stop(&id);
             (*s).status = "正在卸载插件…".into();
             let root = (*s).paths.plugins.clone();
             let tx = (*s).tx.clone();
@@ -1107,11 +1206,13 @@ unsafe fn handle_events(hwnd: HWND) {
                     )
                 };
                 rebuild(hwnd);
+                sync_plugin_hotkeys(hwnd);
             }
             Event::Installed(result) => match result {
                 Ok(manifest) => {
                     (*s).settings.disabled_plugins.remove(&manifest.id);
                     save_settings(hwnd);
+                    sync_plugin_hotkeys(hwnd);
                     navigate(hwnd, Page::Plugins);
                     start_refresh(hwnd);
                 }
@@ -1132,6 +1233,7 @@ unsafe fn handle_events(hwnd: HWND) {
                         alert(hwnd, &e, false);
                     }
                     save_settings(hwnd);
+                    sync_plugin_hotkeys(hwnd);
                     (*s).index = build_index(&(*s).cache, &(*s).settings);
                     (*s).status = "插件已卸载".into();
                     navigate(hwnd, Page::Plugins);
@@ -1440,6 +1542,17 @@ unsafe fn tray_menu(hwnd: HWND) {
     if popup.is_null() {
         return;
     }
+    AppendMenuW(
+        popup,
+        MF_STRING
+            | if autostart_enabled() {
+                MF_CHECKED
+            } else {
+                MF_UNCHECKED
+            },
+        2,
+        wide("自启动").as_ptr(),
+    );
     AppendMenuW(popup, MF_STRING, 1, wide("关闭").as_ptr());
     let mut point: POINT = zeroed();
     GetCursorPos(&mut point);
@@ -1458,8 +1571,10 @@ unsafe fn tray_menu(hwnd: HWND) {
     (*s).dialog = false;
     // Let the shell dismiss the menu reliably on subsequent tray clicks.
     PostMessageW(hwnd, WM_NULL, 0, 0);
-    if selected == 1 {
-        act(hwnd, Action::Exit);
+    match selected {
+        1 => act(hwnd, Action::Exit),
+        2 => act(hwnd, Action::Autostart),
+        _ => {}
     }
 }
 
@@ -1795,7 +1910,41 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             return 0;
         }
+        crate::gesture::WM_QUICK_PIN => {
+            while let Some(region) = (*s).gesture.as_ref().and_then(|gesture| gesture.region()) {
+                hide(hwnd, false);
+                if let Err(e) = (*s).sessions.invoke_region(
+                    &(*s).paths,
+                    &(*s).settings,
+                    "capture",
+                    "quick",
+                    Some(region),
+                ) {
+                    alert(hwnd, &e, false);
+                }
+            }
+            return 0;
+        }
         WM_HOTKEY => {
+            if let Some((id, action)) = (*s).plugin_hotkeys.get(&(w as i32)).cloned() {
+                let modifiers = l as u32 & 0xffff;
+                let key = (l as u32 >> 16) & 0xffff;
+                if IsWindowVisible(hwnd) != 0
+                    && modifiers == MOD_ALT
+                    && (0x31..=0x39).contains(&key)
+                {
+                    PostMessageW(hwnd, WM_NUMBER_ACTION, (key - 0x31) as usize, 0);
+                    return 0;
+                }
+                hide(hwnd, false);
+                if let Err(e) = (*s)
+                    .sessions
+                    .invoke(&(*s).paths, &(*s).settings, &id, &action)
+                {
+                    alert(hwnd, &e, false);
+                }
+                return 0;
+            }
             trace(hwnd, "hotkey");
             if IsWindowVisible(hwnd) != 0 {
                 hide(hwnd, true);
@@ -1887,6 +2036,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             return 0;
         }
         WM_DESTROY => {
+            (*s).gesture = None;
+            for (id, _) in (*s).plugin_hotkeys.drain() {
+                UnregisterHotKey(hwnd, id);
+            }
             UnregisterHotKey(hwnd, HOTKEY_ID);
             Shell_NotifyIconW(NIM_DELETE, &(*s).tray);
             PostQuitMessage(0);
