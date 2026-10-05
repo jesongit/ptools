@@ -22,13 +22,16 @@
 }
 ```
 
-`target` 支持 `path`（绝对路径）、`url`（http/https）、`app`（Windows AppsFolder 标识）：
+`target` 支持 `path`（绝对路径）、`url`（http/https）、`app`（Windows AppsFolder 标识），以及 ptools 0.1.2 新增的 `system`（内置 Windows 入口 ID）：
 
 ```json
 {"kind":"path","path":"C:\\Windows\\System32\\notepad.exe"}
+{"kind":"system","id":"device-manager"}
 ```
 
 本体执行的是独立的启动目标，不拼接 shell 命令。v1 不支持自定义命令参数和实时查询回调。
+
+`system` 仅接受 `crates/core/src/system.rs` 的固定目录 ID，未知 ID 会被拒绝。系统文件通过 Windows API 定位系统目录；设置与文件夹使用目录内固定的 `ms-settings:` / `shell:` 目标，不能在插件清单中传入任意协议或命令。原有目标和索引协议保持兼容；使用 `system` 目标的插件需要 ptools 0.1.2 或以上，因此更新应用启动插件时应使用新版完整包。
 
 ## EXE 插件
 

@@ -1,6 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::input::{InputMode, InputState};
 use ptools_core::*;
+use ptools_ui as theme;
 use std::{
     collections::{HashMap, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
@@ -14,7 +16,9 @@ use windows_sys::Win32::{
     Graphics::{Dwm::*, Gdi::*},
     System::{
         Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
         LibraryLoader::GetModuleHandleW,
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
         Registry::*,
         Threading::CreateMutexW,
     },
@@ -33,6 +37,9 @@ const HOTKEY_ID: i32 = 101;
 const EDIT_ID: usize = 201;
 const LIST_ID: usize = 202;
 const MENU_ID: usize = 203;
+const COPY_ID: usize = 204;
+const OUTPUT_ID: usize = 205;
+const OUTPUT_STATUS_ID: usize = 206;
 const TIMER_SMOKE: usize = 301;
 const MAX_ICONS: usize = 64;
 // winresource::set_icon embeds the application icon with resource ID 1.
@@ -40,9 +47,6 @@ const APPLICATION_ICON_ID: usize = 1;
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
-}
-fn color(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
 unsafe fn application_icon(small: bool) -> HICON {
@@ -105,6 +109,16 @@ enum Event {
     Refreshed(Cache, Vec<String>),
     Installed(Result<Manifest>),
     Uninstalled(String, Result<()>),
+    CommandFinished(u64, Result<crate::command::CommandResult>),
+}
+
+struct ResultPanel {
+    title: String,
+    metadata: String,
+    output: String,
+    copy: Option<String>,
+    terminal: bool,
+    error: bool,
 }
 
 struct State {
@@ -117,7 +131,8 @@ struct State {
     index: Vec<SearchEntry>,
     page: Page,
     rows: Vec<Row>,
-    query: String,
+    input: InputState,
+    mode_exit_delete: Option<usize>,
     status: String,
     busy: bool,
     dialog: bool,
@@ -128,9 +143,20 @@ struct State {
     list: HWND,
     button: HWND,
     menu_hover: bool,
+    output: HWND,
+    copy_button: HWND,
+    output_status: HWND,
+    panel: Option<ResultPanel>,
+    copied: bool,
+    command_directory: PathBuf,
+    submitted_command: String,
+    command_running: bool,
+    command_id: u64,
+    command_result: Option<Result<crate::command::CommandResult>>,
     font: HFONT,
     small_font: HFONT,
     search_font: HFONT,
+    output_font: HFONT,
     background: HBRUSH,
     scale: f64,
     tx: Sender<Event>,
@@ -237,7 +263,7 @@ pub fn run(
             .retain(|id, _| plugins.iter().any(|p| &p.manifest.id == id));
         let index = build_index(&cache, &settings);
         let (tx, rx) = mpsc::channel();
-        let background = CreateSolidBrush(color(250, 251, 253));
+        let background = CreateSolidBrush(theme::BACKGROUND);
         let mut app = Box::new(State {
             gesture: None,
             sessions: Default::default(),
@@ -248,9 +274,10 @@ pub fn run(
             index,
             page: Page::Home,
             rows: vec![],
-            query: String::new(),
+            input: InputState::default(),
+            mode_exit_delete: None,
             status: if errors.is_empty() {
-                "输入应用名称 · 拼音 / 首字母也可以".into()
+                "输入应用或系统功能 · 拼音 / 首字母也可以".into()
             } else {
                 format!("{} 个插件加载失败，输入“设置”查看日志", errors.len())
             },
@@ -263,9 +290,20 @@ pub fn run(
             list: null_mut(),
             button: null_mut(),
             menu_hover: false,
+            output: null_mut(),
+            copy_button: null_mut(),
+            output_status: null_mut(),
+            panel: None,
+            copied: false,
+            command_directory: crate::command::working_directory(),
+            submitted_command: String::new(),
+            command_running: false,
+            command_id: 0,
+            command_result: None,
             font: null_mut(),
             small_font: null_mut(),
             search_font: null_mut(),
+            output_font: null_mut(),
             background,
             scale: GetDpiForSystem() as f64 / 96.0,
             tx,
@@ -313,7 +351,7 @@ pub fn run(
             CloseHandle(mutex);
             return Err(format!("创建窗口失败：{}", GetLastError()));
         }
-        let rounded: u32 = 2;
+        let rounded: u32 = 3;
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
@@ -327,7 +365,7 @@ pub fn run(
         setup_tray(hwnd);
         sync_plugin_hotkeys(hwnd);
         rebuild(hwnd);
-        if !hidden || !app.hotkey_ok {
+        if !hidden {
             show(hwnd);
         }
         start_refresh(hwnd);
@@ -346,7 +384,7 @@ pub fn run(
         for (_, icon) in app.icons.drain() {
             DestroyIcon(icon);
         }
-        for font in [app.font, app.small_font, app.search_font] {
+        for font in [app.font, app.small_font, app.search_font, app.output_font] {
             if !font.is_null() {
                 DeleteObject(font);
             }
@@ -422,10 +460,11 @@ unsafe fn sync_plugin_hotkeys(hwnd: HWND) {
 unsafe fn fonts(hwnd: HWND) {
     let s = state(hwnd);
     let mut old = Vec::new();
-    for (slot, size, weight) in [
-        (&raw mut (*s).font, 15, 400),
-        (&raw mut (*s).small_font, 11, 400),
-        (&raw mut (*s).search_font, 21, 400),
+    for (slot, size, weight, family) in [
+        (&raw mut (*s).font, 15, 400, "Microsoft YaHei UI"),
+        (&raw mut (*s).small_font, 11, 400, "Microsoft YaHei UI"),
+        (&raw mut (*s).search_font, 21, 400, "Microsoft YaHei UI"),
+        (&raw mut (*s).output_font, 14, 400, "Consolas"),
     ] {
         old.push(*slot);
         *slot = CreateFontW(
@@ -442,12 +481,24 @@ unsafe fn fonts(hwnd: HWND) {
             CLIP_DEFAULT_PRECIS as u32,
             CLEARTYPE_QUALITY as u32,
             DEFAULT_PITCH as u32,
-            wide("Microsoft YaHei UI").as_ptr(),
+            wide(family).as_ptr(),
         );
     }
     SendMessageW((*s).edit, WM_SETFONT, (*s).search_font as usize, 1);
     SendMessageW((*s).list, WM_SETFONT, (*s).font as usize, 1);
     SendMessageW((*s).button, WM_SETFONT, (*s).font as usize, 1);
+    SendMessageW((*s).copy_button, WM_SETFONT, (*s).font as usize, 1);
+    SendMessageW((*s).output_status, WM_SETFONT, (*s).small_font as usize, 1);
+    SendMessageW(
+        (*s).output,
+        WM_SETFONT,
+        if (*s).panel.as_ref().is_some_and(|panel| panel.terminal) {
+            (*s).output_font as usize
+        } else {
+            (*s).search_font as usize
+        },
+        1,
+    );
     SendMessageW((*s).list, LB_SETITEMHEIGHT, 0, px(s, 58) as isize);
     for font in old {
         if !font.is_null() {
@@ -534,7 +585,16 @@ unsafe fn layout(hwnd: HWND) {
     }
     let work = info.rcWork;
     let count = (*s).rows.len().min(7) as i32;
-    let list_height = if count == 0 {
+    let list_height = if let Some(panel) = &(*s).panel {
+        px(
+            s,
+            if panel.terminal {
+                118 + panel.output.lines().count().clamp(4, 10) as i32 * 18
+            } else {
+                150
+            },
+        )
+    } else if count == 0 {
         px(s, 52)
     } else {
         px(s, 58) * count
@@ -553,7 +613,18 @@ unsafe fn layout(hwnd: HWND) {
         SWP_NOZORDER | SWP_NOACTIVATE,
     );
     position_children(hwnd);
-    ShowWindow((*s).list, if count > 0 { SW_SHOWNA } else { SW_HIDE });
+    let quick = (*s).panel.is_some();
+    ShowWindow(
+        (*s).list,
+        if !quick && count > 0 {
+            SW_SHOWNA
+        } else {
+            SW_HIDE
+        },
+    );
+    for control in [(*s).output, (*s).copy_button, (*s).output_status] {
+        ShowWindow(control, if quick { SW_SHOWNA } else { SW_HIDE });
+    }
     InvalidateRect(hwnd, null(), 0);
 }
 
@@ -587,6 +658,51 @@ unsafe fn position_children(hwnd: HWND) {
         list_height,
         1,
     );
+    MoveWindow(
+        (*s).copy_button,
+        width - px(s, 126),
+        px(s, 88),
+        px(s, 100),
+        px(s, 32),
+        1,
+    );
+    MoveWindow(
+        (*s).output_status,
+        px(s, 26),
+        px(s, 119),
+        width - px(s, 54),
+        px(s, 22),
+        1,
+    );
+    MoveWindow(
+        (*s).output,
+        px(s, 28),
+        px(s, 155),
+        (width - px(s, 58)).max(1),
+        (rect.bottom - px(s, 218)).max(1),
+        1,
+    );
+    if let Some(panel) = &(*s).panel {
+        let mut rect: RECT = zeroed();
+        GetClientRect((*s).output, &mut rect);
+        let columns = (rect.right as f64 / (7.8 * (*s).scale)).max(1.0) as usize;
+        let horizontal = panel.terminal
+            && panel.output.lines().any(|line| {
+                line.chars()
+                    .map(|c| if c.is_ascii() { 1 } else { 2 })
+                    .sum::<usize>()
+                    > columns
+            });
+        let visible_lines = ((rect.bottom - if horizontal { px(s, 18) } else { 0 })
+            / px(s, 18).max(1))
+        .max(1) as usize;
+        ShowScrollBar((*s).output, SB_HORZ, i32::from(horizontal));
+        ShowScrollBar(
+            (*s).output,
+            SB_VERT,
+            i32::from(panel.terminal && panel.output.lines().count() > visible_lines),
+        );
+    }
 }
 
 fn command(title: &str, subtitle: &str, badge: &str, action: Action) -> Row {
@@ -598,9 +714,168 @@ fn command(title: &str, subtitle: &str, badge: &str, action: Action) -> Row {
     }
 }
 
+fn entry_badge(entry: &Entry) -> &'static str {
+    match &entry.target {
+        Target::System { id } => match system_command(id).map(|command| &command.location) {
+            Some(SystemLocation::Uri(uri)) if uri.starts_with("shell:") => "目录",
+            Some(SystemLocation::Uri(_)) => "设置",
+            _ => "系统",
+        },
+        _ => "应用",
+    }
+}
+
+fn result_panel(state: &State) -> Option<ResultPanel> {
+    if !matches!(state.page, Page::Home) {
+        return None;
+    }
+    match state.input.mode {
+        InputMode::Search => None,
+        InputMode::Calculator => {
+            let expression = state.input.text.trim();
+            let (output, copy, error) = if expression.is_empty() {
+                ("例如：(18 + 2) * 3".into(), None, false)
+            } else {
+                match crate::calculator::evaluate(expression) {
+                    Ok(value) => (value.clone(), Some(value), false),
+                    Err(error) => (error, None, true),
+                }
+            };
+            Some(ResultPanel {
+                title: if error {
+                    "表达式有误"
+                } else {
+                    "计算结果"
+                }
+                .into(),
+                metadata: "实时计算 · 支持括号、四则运算、幂和取余".into(),
+                output,
+                copy,
+                terminal: false,
+                error,
+            })
+        }
+        InputMode::Terminal => {
+            let command = state.input.text.trim();
+            let mut panel = ResultPanel {
+                title: "终端命令".into(),
+                metadata: format!("PowerShell · {}", state.command_directory.display()),
+                output: "输入命令后按 Enter 执行\n例如：Get-Date 或 ipconfig".into(),
+                copy: None,
+                terminal: true,
+                error: false,
+            };
+            if state.command_running {
+                panel.title = "正在执行".into();
+                panel.output = if command == state.submitted_command {
+                    "命令正在运行，结果将在这里显示…".into()
+                } else {
+                    "上一条命令仍在运行，完成后可执行这条命令。".into()
+                };
+                panel.metadata = "PowerShell · 正在执行".into();
+            } else if !command.is_empty() && command == state.submitted_command {
+                match &state.command_result {
+                    Some(Ok(result)) => {
+                        panel.error =
+                            result.timed_out || result.truncated || result.exit_code != Some(0);
+                        panel.title = if result.timed_out {
+                            "执行超时"
+                        } else if result.truncated {
+                            "输出已截断"
+                        } else if panel.error {
+                            "命令失败"
+                        } else {
+                            "命令输出"
+                        }
+                        .into();
+                        let exit = result.exit_code.map_or("—".into(), |code| code.to_string());
+                        panel.metadata = format!(
+                            "PowerShell · 退出码 {exit} · {} ms{}",
+                            result.elapsed.as_millis(),
+                            if result.truncated {
+                                " · 输出已截断"
+                            } else {
+                                ""
+                            },
+                        );
+                        panel.output = if result.output.is_empty() {
+                            "命令没有输出。".into()
+                        } else {
+                            result.output.clone()
+                        };
+                        if result.timed_out {
+                            panel.output.push_str("\n\n命令超过 30 秒，已停止运行。");
+                        } else if result.truncated {
+                            panel
+                                .output
+                                .push_str("\n\n输出超过 1 MiB，命令已停止运行。");
+                        }
+                        panel.copy = (!result.output.is_empty()).then(|| result.output.clone());
+                    }
+                    Some(Err(error)) => {
+                        panel.title = "执行失败".into();
+                        panel.output = error.clone();
+                        panel.copy = Some(error.clone());
+                        panel.error = true;
+                    }
+                    None => {}
+                }
+            }
+            Some(panel)
+        }
+    }
+}
+
+unsafe fn update_result_panel(hwnd: HWND) {
+    let s = state(hwnd);
+    let panel = result_panel(&*s);
+    if let Some(panel) = &panel {
+        let text = panel.output.replace("\r\n", "\n").replace('\n', "\r\n");
+        // A refresh event should not reset a user's selection or output scroll position.
+        if (*s)
+            .panel
+            .as_ref()
+            .is_none_or(|old| old.output != panel.output)
+        {
+            SetWindowTextW((*s).output, wide(&text).as_ptr());
+        }
+        SetWindowTextW((*s).output_status, wide(&panel.metadata).as_ptr());
+        EnableWindow((*s).copy_button, i32::from(panel.copy.is_some()));
+        SetWindowTextW(
+            (*s).copy_button,
+            wide(if (*s).copied {
+                "已复制 ✓"
+            } else {
+                "复制结果"
+            })
+            .as_ptr(),
+        );
+        SendMessageW(
+            (*s).output,
+            WM_SETFONT,
+            if panel.terminal {
+                (*s).output_font
+            } else if panel.copy.is_some() {
+                (*s).search_font
+            } else {
+                (*s).font
+            } as usize,
+            1,
+        );
+    }
+    (*s).panel = panel;
+}
+
 unsafe fn rebuild(hwnd: HWND) {
     let s = state(hwnd);
-    let query = (*s).query.trim().to_lowercase();
+    update_result_panel(hwnd);
+    if (*s).panel.is_some() {
+        (*s).rows.clear();
+        SendMessageW((*s).list, LB_RESETCONTENT, 0, 0);
+        layout(hwnd);
+        return;
+    }
+    let query = (*s).input.text.trim().to_lowercase();
     let mut rows = Vec::new();
     match (*s).page.clone() {
         Page::Home => {
@@ -610,7 +885,7 @@ unsafe fn rebuild(hwnd: HWND) {
                     rows.push(Row {
                         title: hit.entry.title.clone(),
                         subtitle: hit.entry.subtitle.clone(),
-                        badge: "应用".into(),
+                        badge: entry_badge(&hit.entry).into(),
                         action: Action::Launch(Box::new(hit)),
                     });
                 }
@@ -621,7 +896,7 @@ unsafe fn rebuild(hwnd: HWND) {
                         rows.push(Row {
                             title: hit.entry.title.clone(),
                             subtitle: "最近使用".into(),
-                            badge: "应用".into(),
+                            badge: entry_badge(&hit.entry).into(),
                             action: Action::Launch(Box::new(hit)),
                         });
                     }
@@ -670,8 +945,7 @@ unsafe fn rebuild(hwnd: HWND) {
             ] {
                 if !query.is_empty()
                     && (keywords.split_whitespace().any(|x| x.starts_with(&query))
-                        || row.title.contains(&query)
-                        || query == ">")
+                        || row.title.contains(&query))
                 {
                     rows.insert(0, row);
                 }
@@ -679,7 +953,7 @@ unsafe fn rebuild(hwnd: HWND) {
         }
         Page::Menu => {
             for row in [
-                command("返回搜索", "搜索应用、拼音或首字母", "←", Action::Home),
+                command("返回搜索", "搜索应用、系统功能或拼音", "←", Action::Home),
                 command("刷新应用索引", "重新发现已安装的应用", "↻", Action::Refresh),
                 command("插件管理", "安装与管理你的本地插件", "+", Action::Plugins),
                 command("设置", "快捷键、开机启动和数据目录", "⚙", Action::Settings),
@@ -821,17 +1095,46 @@ unsafe fn rebuild(hwnd: HWND) {
     InvalidateRect((*s).list, null(), 1);
 }
 
+unsafe fn sync_input_control(hwnd: HWND) {
+    let s = state(hwnd);
+    let cue = match (*s).input.mode {
+        InputMode::Search => "搜索应用，= 计算，> 运行命令",
+        InputMode::Calculator => "输入算式，如 1 + 2 * 3",
+        InputMode::Terminal => "输入命令，如 Get-Date",
+    };
+    (*s).suppress_edit = true;
+    SetWindowTextW((*s).edit, wide(&(*s).input.text).as_ptr());
+    SendMessageW((*s).edit, EM_SETCUEBANNER, 1, wide(cue).as_ptr() as isize);
+    SendMessageW((*s).edit, EM_SETSEL, usize::MAX, -1);
+    (*s).suppress_edit = false;
+}
+
+unsafe fn leave_input_mode(hwnd: HWND) -> bool {
+    let s = state(hwnd);
+    if !(*s).input.leave_mode() {
+        return false;
+    }
+    (*s).copied = false;
+    sync_input_control(hwnd);
+    rebuild(hwnd);
+    if IsWindowVisible(hwnd) != 0 {
+        SetFocus((*s).edit);
+    }
+    true
+}
+
 unsafe fn navigate(hwnd: HWND, page: Page) {
     let s = state(hwnd);
     let cue = match &page {
-        Page::Home => "搜索应用、拼音或首字母",
+        Page::Home => "搜索应用，= 计算，> 运行命令",
         Page::Menu => "菜单",
         Page::Plugins => "插件管理",
         Page::Plugin(_) => "插件设置",
         Page::Settings => "设置",
     };
     (*s).page = page;
-    (*s).query.clear();
+    (*s).input.reset();
+    (*s).mode_exit_delete = None;
     (*s).suppress_edit = true;
     SetWindowTextW((*s).edit, wide("").as_ptr());
     SendMessageW((*s).edit, EM_SETCUEBANNER, 1, wide(cue).as_ptr() as isize);
@@ -913,7 +1216,7 @@ unsafe fn shell_open(hwnd: HWND, target: &str) -> bool {
         alert(
             hwnd,
             &format!(
-                "无法打开目标（错误 {}）。应用可能已被移除，请刷新索引。",
+                "无法打开目标（错误 {}）。目标可能不可用或已被移除，请刷新索引。",
                 result as isize
             ),
             false,
@@ -927,6 +1230,14 @@ unsafe fn shell_open(hwnd: HWND, target: &str) -> bool {
 #[allow(clippy::needless_borrow)]
 unsafe fn execute(hwnd: HWND) {
     let s = state(hwnd);
+    if (*s).panel.is_some() {
+        match (*s).input.mode {
+            InputMode::Calculator => copy_result(hwnd),
+            InputMode::Terminal => start_command(hwnd),
+            InputMode::Search => {}
+        }
+        return;
+    }
     let selected = SendMessageW((*s).list, LB_GETCURSEL, 0, 0);
     if selected < 0 {
         return;
@@ -935,6 +1246,82 @@ unsafe fn execute(hwnd: HWND) {
         return;
     };
     act(hwnd, row.action);
+}
+
+unsafe fn copy_result(hwnd: HWND) {
+    let s = state(hwnd);
+    let Some(text) = (*s)
+        .panel
+        .as_ref()
+        .and_then(|panel| panel.copy.as_ref())
+        .cloned()
+    else {
+        return;
+    };
+    let value = wide(&text);
+    let memory = GlobalAlloc(GMEM_MOVEABLE, value.len() * size_of::<u16>());
+    let error = if memory.is_null() {
+        Some("无法分配剪贴板内存")
+    } else {
+        let buffer = GlobalLock(memory);
+        if buffer.is_null() {
+            GlobalFree(memory);
+            Some("无法访问剪贴板内存")
+        } else {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), buffer.cast(), value.len());
+            GlobalUnlock(memory);
+            if OpenClipboard(hwnd) == 0 {
+                GlobalFree(memory);
+                Some("剪贴板正被占用，请再试一次")
+            } else {
+                let copied = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null();
+                CloseClipboard();
+                if copied {
+                    None
+                } else {
+                    GlobalFree(memory);
+                    Some("复制失败，请再试一次")
+                }
+            }
+        }
+    };
+    if let Some(error) = error {
+        SetWindowTextW((*s).output_status, wide(error).as_ptr());
+    } else {
+        (*s).copied = true;
+        SetWindowTextW((*s).copy_button, wide("已复制 ✓").as_ptr());
+    }
+    InvalidateRect(hwnd, null(), 0);
+}
+
+unsafe fn start_command(hwnd: HWND) {
+    let s = state(hwnd);
+    if (*s).command_running {
+        return;
+    }
+    if (*s).input.mode != InputMode::Terminal {
+        return;
+    }
+    let command = (*s).input.text.trim();
+    if command.is_empty() {
+        return;
+    }
+    let command = command.to_owned();
+    (*s).submitted_command = command.clone();
+    (*s).command_result = None;
+    (*s).command_running = true;
+    (*s).copied = false;
+    (*s).command_id = (*s).command_id.wrapping_add(1);
+    let request = (*s).command_id;
+    let directory = (*s).command_directory.clone();
+    let tx = (*s).tx.clone();
+    let window = hwnd as usize;
+    std::thread::spawn(move || {
+        let result = crate::command::run(&command, &directory);
+        let _ = tx.send(Event::CommandFinished(request, result));
+        PostMessageW(window as HWND, WM_WORK, 0, 0);
+    });
+    rebuild(hwnd);
 }
 
 unsafe fn act(hwnd: HWND, action: Action) {
@@ -955,6 +1342,18 @@ unsafe fn act(hwnd: HWND, action: Action) {
                 Target::Path { path } => path.replace('/', "\\"),
                 Target::Url { url } => url.clone(),
                 Target::App { app_id } => format!("shell:AppsFolder\\{app_id}"),
+                Target::System { id } => {
+                    let resolved = system_command(id)
+                        .ok_or_else(|| "未知的 Windows 系统入口".to_string())
+                        .and_then(SystemCommand::resolve);
+                    match resolved {
+                        Ok(target) => target,
+                        Err(error) => {
+                            alert(hwnd, &error, false);
+                            return;
+                        }
+                    }
+                }
                 Target::Plugin { .. } => unreachable!(),
             };
             // Hide before launch so focus loss from the launched application cannot restore a stale foreground window.
@@ -1183,10 +1582,18 @@ unsafe fn handle_events(hwnd: HWND) {
     let s = state(hwnd);
     let events: Vec<_> = (*s).rx.try_iter().collect();
     for event in events {
-        if !matches!(&event, Event::Icon(_, _)) {
+        if !matches!(&event, Event::Icon(_, _) | Event::CommandFinished(_, _)) {
             (*s).busy = false;
         }
         match event {
+            Event::CommandFinished(request, result) => {
+                if request == (*s).command_id {
+                    (*s).command_running = false;
+                    (*s).command_result = Some(result);
+                    (*s).copied = false;
+                    rebuild(hwnd);
+                }
+            }
             Event::Icon(path, icon) => {
                 (*s).icons.insert(path, icon as HICON);
                 InvalidateRect((*s).list, null(), 0);
@@ -1197,7 +1604,7 @@ unsafe fn handle_events(hwnd: HWND) {
                 (*s).status = if !(*s).hotkey_ok {
                     format!("{} 已被占用，输入“设置”更换", (*s).settings.hotkey)
                 } else if errors.is_empty() {
-                    format!("{} 个应用入口 · 输入“插件”或“设置”管理", (*s).index.len())
+                    format!("{} 个启动入口 · 输入“插件”或“设置”管理", (*s).index.len())
                 } else {
                     format!(
                         "{} 个入口 · {} 条刷新警告，设置中查看日志",
@@ -1266,10 +1673,23 @@ unsafe fn app_icon(hwnd: HWND, s: *mut State, row: &Row) -> HICON {
     let Action::Launch(entry) = &row.action else {
         return null_mut();
     };
-    let Target::Path { path } = &entry.entry.target else {
-        return null_mut();
+    let path = match &entry.entry.target {
+        Target::Path { path } => path.clone(),
+        Target::System { id } => {
+            let Some(command) = system_command(id) else {
+                return null_mut();
+            };
+            if !matches!(command.location, SystemLocation::File(_)) {
+                return null_mut();
+            }
+            let Ok(path) = command.resolve() else {
+                return null_mut();
+            };
+            path
+        }
+        _ => return null_mut(),
     };
-    if let Some(icon) = (*s).icons.get(path) {
+    if let Some(icon) = (*s).icons.get(&path) {
         return *icon;
     }
     if (*s).icons.len() >= MAX_ICONS {
@@ -1326,9 +1746,9 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
     let selected = draw.itemState & ODS_SELECTED != 0;
     let rect = draw.rcItem;
     let brush = CreateSolidBrush(if selected {
-        color(232, 241, 255)
+        theme::SELECTION
     } else {
-        color(250, 251, 253)
+        theme::BACKGROUND
     });
     FillRect(draw.hDC, &rect, (*s).background);
     if selected {
@@ -1340,13 +1760,25 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
             rect.top + px(s, 2),
             rect.right,
             rect.bottom - px(s, 2),
-            px(s, 12),
-            px(s, 12),
+            px(s, 3),
+            px(s, 3),
         );
         SelectObject(draw.hDC, old_pen);
         SelectObject(draw.hDC, old_brush);
     }
     DeleteObject(brush);
+    if selected {
+        theme::fill(
+            draw.hDC,
+            &RECT {
+                left: rect.left,
+                top: rect.top + px(s, 6),
+                right: rect.left + px(s, 3),
+                bottom: rect.bottom - px(s, 6),
+            },
+            theme::ACCENT,
+        );
+    }
     let (top, visible) = visible_rows((*s).list);
     let slot = draw.itemID as isize - top;
     if slot >= 0 && slot < visible {
@@ -1360,7 +1792,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
             &(slot + 1).to_string(),
             number_rect,
             (*s).small_font,
-            color(125, 135, 152),
+            theme::MUTED,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
     }
@@ -1390,7 +1822,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
             glyph,
             badge,
             (*s).font,
-            color(57, 104, 190),
+            theme::ACCENT,
             DT_CENTER | DT_VCENTER | DT_SINGLELINE,
         );
     }
@@ -1405,7 +1837,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
         &row.title,
         title_rect,
         (*s).font,
-        color(30, 39, 56),
+        theme::TEXT,
         DT_SINGLELINE | DT_END_ELLIPSIS,
     );
     let subtitle_rect = RECT {
@@ -1419,7 +1851,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
         &row.subtitle,
         subtitle_rect,
         (*s).small_font,
-        color(110, 120, 137),
+        theme::MUTED,
         DT_SINGLELINE | DT_END_ELLIPSIS,
     );
     if selected {
@@ -1434,7 +1866,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
             "↵",
             arrow,
             (*s).font,
-            color(57, 104, 190),
+            theme::ACCENT,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
         );
     }
@@ -1448,16 +1880,43 @@ unsafe fn paint(hwnd: HWND) {
     let mut client: RECT = zeroed();
     GetClientRect(hwnd, &mut client);
     FillRect(dc, &ps.rcPaint, (*s).background);
-    let pen = CreatePen(PS_SOLID, px(s, 2).max(1), color(71, 109, 176));
-    let old_pen = SelectObject(dc, pen);
-    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-    Ellipse(dc, px(s, 23), px(s, 30), px(s, 39), px(s, 46));
-    MoveToEx(dc, px(s, 37), px(s, 44), null_mut());
-    LineTo(dc, px(s, 44), px(s, 51));
-    SelectObject(dc, old_pen);
-    SelectObject(dc, old_brush);
-    DeleteObject(pen);
-    let line_brush = CreateSolidBrush(color(226, 232, 241));
+    theme::frame(dc, &client, theme::BORDER);
+    theme::fill(
+        dc,
+        &RECT {
+            left: px(s, 16),
+            top: client.bottom - px(s, 37),
+            right: client.right - px(s, 16),
+            bottom: client.bottom - px(s, 36),
+        },
+        theme::BORDER,
+    );
+    if let Some(panel) = &(*s).panel {
+        draw_text(
+            dc,
+            if panel.terminal { ">" } else { "=" },
+            RECT {
+                left: px(s, 20),
+                top: px(s, 24),
+                right: px(s, 46),
+                bottom: px(s, 58),
+            },
+            (*s).search_font,
+            theme::ACCENT,
+            DT_SINGLELINE | DT_CENTER | DT_VCENTER,
+        );
+    } else {
+        let pen = CreatePen(PS_SOLID, px(s, 2).max(1), theme::ACCENT);
+        let old_pen = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Ellipse(dc, px(s, 23), px(s, 30), px(s, 39), px(s, 46));
+        MoveToEx(dc, px(s, 37), px(s, 44), null_mut());
+        LineTo(dc, px(s, 44), px(s, 51));
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen);
+    }
+    let line_brush = CreateSolidBrush(theme::BORDER);
     let line = RECT {
         left: px(s, 16),
         top: px(s, 75),
@@ -1466,19 +1925,45 @@ unsafe fn paint(hwnd: HWND) {
     };
     FillRect(dc, &line, line_brush);
     DeleteObject(line_brush);
-    if (*s).rows.is_empty() {
+    if let Some(panel) = &(*s).panel {
+        let rect = RECT {
+            left: px(s, 16),
+            top: px(s, 84),
+            right: client.right - px(s, 16),
+            bottom: client.bottom - px(s, 48),
+        };
+        theme::fill(dc, &rect, theme::SURFACE);
+        theme::frame(dc, &rect, theme::BORDER);
+        draw_text(
+            dc,
+            &panel.title,
+            RECT {
+                left: px(s, 26),
+                top: px(s, 90),
+                right: client.right - px(s, 140),
+                bottom: px(s, 117),
+            },
+            (*s).font,
+            if panel.error {
+                theme::DANGER
+            } else {
+                theme::TEXT
+            },
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
+    } else if (*s).rows.is_empty() {
         let empty = if !matches!((*s).page, Page::Home) {
             "这里暂时没有内容"
-        } else if !(&(*s).query).is_empty() {
+        } else if !(&(*s).input.text).is_empty() {
             "没有找到应用 · 输入“刷新”更新索引"
         } else if (*s).index.is_empty() {
             if (*s).busy {
                 "正在发现你的应用…"
             } else {
-                "还没有应用入口 · 输入“插件”安装插件"
+                "还没有启动入口 · 输入“插件”安装插件"
             }
         } else {
-            "从一个应用名称开始。"
+            "试试设备管理器、显示设置或应用名称。"
         };
         let rect = RECT {
             left: px(s, 24),
@@ -1491,11 +1976,19 @@ unsafe fn paint(hwnd: HWND) {
             empty,
             rect,
             (*s).font,
-            color(131, 142, 160),
+            theme::MUTED,
             DT_SINGLELINE | DT_VCENTER,
         );
     }
-    let status = (*s).status.clone();
+    let status = if let Some(panel) = &(*s).panel {
+        if panel.terminal {
+            "终端命令".into()
+        } else {
+            "计算器 · 实时计算".into()
+        }
+    } else {
+        (*s).status.clone()
+    };
     let footer = RECT {
         left: px(s, 20),
         top: client.bottom - px(s, 31),
@@ -1507,7 +2000,7 @@ unsafe fn paint(hwnd: HWND) {
         &status,
         footer,
         (*s).small_font,
-        color(125, 135, 152),
+        theme::MUTED,
         DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
     );
     let hints = RECT {
@@ -1517,10 +2010,18 @@ unsafe fn paint(hwnd: HWND) {
     };
     draw_text(
         dc,
-        "Alt+数字 / ↑↓ / Ctrl+J/K 选择   ↵ 打开   Esc 返回",
+        if let Some(panel) = &(*s).panel {
+            if panel.terminal {
+                "↵ 执行   Ctrl+Shift+C 复制   Esc 返回"
+            } else {
+                "↵ 复制   Ctrl+Shift+C 复制   Esc 返回"
+            }
+        } else {
+            "Alt+数字 / ↑↓ / Ctrl+J/K 选择   ↵ 打开   Esc 返回"
+        },
         hints,
         (*s).small_font,
-        color(125, 135, 152),
+        theme::MUTED,
         DT_SINGLELINE | DT_RIGHT | DT_VCENTER,
     );
     EndPaint(hwnd, &ps);
@@ -1583,11 +2084,11 @@ unsafe fn draw_menu_button(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
     let active = matches!((*s).page, Page::Menu);
     FillRect(draw.hDC, &draw.rcItem, (*s).background);
     let brush = CreateSolidBrush(if active || draw.itemState & ODS_SELECTED != 0 {
-        color(232, 241, 255)
+        theme::SELECTION
     } else if (*s).menu_hover {
-        color(237, 241, 247)
+        theme::RAISED
     } else {
-        color(250, 251, 253)
+        theme::BACKGROUND
     });
     let old_brush = SelectObject(draw.hDC, brush);
     let old_pen = SelectObject(draw.hDC, GetStockObject(NULL_PEN));
@@ -1603,7 +2104,7 @@ unsafe fn draw_menu_button(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
     );
     SelectObject(draw.hDC, old_brush);
     DeleteObject(brush);
-    let ink = CreateSolidBrush(color(71, 109, 176));
+    let ink = CreateSolidBrush(theme::ACCENT);
     let old_brush = SelectObject(draw.hDC, ink);
     let cy = (r.top + r.bottom) / 2;
     for offset in [-7, 0, 7] {
@@ -1716,6 +2217,85 @@ unsafe extern "system" fn list_proc(
     result
 }
 
+unsafe fn result_copy_shortcut(hwnd: HWND, msg: u32, w: WPARAM) -> bool {
+    let s = state(hwnd);
+    if (*s).panel.is_none()
+        || (*s).composing
+        || GetKeyState(VK_CONTROL as i32) >= 0
+        || GetKeyState(VK_SHIFT as i32) >= 0
+        || GetKeyState(VK_MENU as i32) < 0
+    {
+        return false;
+    }
+    if msg == WM_KEYDOWN && w == 0x43 {
+        copy_result(hwnd);
+        true
+    } else {
+        // TranslateMessage emits Ctrl+C after WM_KEYDOWN; keep the input's
+        // native copy action from replacing the result just put on the clipboard.
+        msg == WM_CHAR && w == 3
+    }
+}
+
+unsafe fn focus_result_control(hwnd: HWND) {
+    let s = state(hwnd);
+    let mut controls = vec![(*s).edit, (*s).output];
+    if IsWindowEnabled((*s).copy_button) != 0 {
+        controls.push((*s).copy_button);
+    }
+    let current = controls
+        .iter()
+        .position(|&control| control == GetFocus())
+        .unwrap_or(0);
+    let next = if GetKeyState(VK_SHIFT as i32) < 0 {
+        (current + controls.len() - 1) % controls.len()
+    } else {
+        (current + 1) % controls.len()
+    };
+    SetFocus(controls[next]);
+}
+
+unsafe extern "system" fn result_control_proc(
+    hwnd: HWND,
+    msg: u32,
+    w: WPARAM,
+    l: LPARAM,
+    _id: usize,
+    parent: usize,
+) -> LRESULT {
+    let parent = parent as HWND;
+    if result_copy_shortcut(parent, msg, w) {
+        return 0;
+    }
+    match msg {
+        WM_KEYDOWN if w == VK_ESCAPE as usize => {
+            if l & (1 << 30) == 0 {
+                PostMessageW(parent, WM_KEY_ACTION, w, 0);
+            }
+            return 0;
+        }
+        WM_KEYDOWN if w == VK_TAB as usize => {
+            focus_result_control(parent);
+            return 0;
+        }
+        WM_KEYDOWN if w == VK_RETURN as usize => {
+            if l & (1 << 30) == 0 {
+                copy_result(parent);
+            }
+            return 0;
+        }
+        WM_KEYDOWN if w == 0x41 && GetKeyState(VK_CONTROL as i32) < 0 => {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        WM_CHAR if [VK_RETURN as usize, VK_TAB as usize, VK_ESCAPE as usize].contains(&w) => {
+            return 0;
+        }
+        _ => {}
+    }
+    DefSubclassProc(hwnd, msg, w, l)
+}
+
 unsafe extern "system" fn edit_proc(
     hwnd: HWND,
     msg: u32,
@@ -1729,6 +2309,9 @@ unsafe extern "system" fn edit_proc(
     if s.is_null() {
         return DefSubclassProc(hwnd, msg, w, l);
     }
+    if result_copy_shortcut(parent, msg, w) {
+        return 0;
+    }
     if number_shortcut(parent, msg, w, l) {
         return 0;
     }
@@ -1739,7 +2322,32 @@ unsafe extern "system" fn edit_proc(
         WM_IME_ENDCOMPOSITION => {
             (*s).composing = false;
         }
+        WM_KEYUP if (*s).mode_exit_delete == Some(w) => {
+            (*s).mode_exit_delete = None;
+        }
         WM_KEYDOWN if !(*s).composing => {
+            // A held Enter cannot rerun a command; a held Esc only goes back once.
+            if [VK_RETURN as usize, VK_ESCAPE as usize].contains(&w) && l & (1 << 30) != 0 {
+                return 0;
+            }
+            if [VK_BACK as usize, VK_DELETE as usize].contains(&w) {
+                if l & (1 << 30) == 0 {
+                    (*s).mode_exit_delete = None;
+                } else if (*s).mode_exit_delete == Some(w) {
+                    return 0;
+                }
+                let empty_tool = {
+                    let input = &(*s).input;
+                    input.mode != InputMode::Search && input.text.is_empty()
+                };
+                if empty_tool {
+                    leave_input_mode(parent);
+                    // Swallow the translated Backspace character and held-key
+                    // repeats, which otherwise delete the restored search text.
+                    (*s).mode_exit_delete = Some(w);
+                    return 0;
+                }
+            }
             if GetKeyState(VK_CONTROL as i32) < 0
                 && GetKeyState(VK_MENU as i32) >= 0
                 && [0x4A, 0x4B].contains(&w)
@@ -1764,6 +2372,13 @@ unsafe extern "system" fn edit_proc(
                 SendMessageW(hwnd, EM_SETSEL, 0, -1);
                 return 0;
             }
+        }
+        WM_CHAR
+            if !(*s).composing
+                && [VK_BACK as usize, 0x7F].contains(&w)
+                && (*s).mode_exit_delete == Some(VK_BACK as usize) =>
+        {
+            return 0;
         }
         WM_CHAR
             if !(*s).composing
@@ -1845,16 +2460,78 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 module,
                 null(),
             );
+            (*s).copy_button = CreateWindowExW(
+                0,
+                wide("BUTTON").as_ptr(),
+                wide("复制结果").as_ptr(),
+                WS_CHILD | WS_TABSTOP | BS_PUSHBUTTON as u32,
+                0,
+                0,
+                100,
+                32,
+                hwnd,
+                COPY_ID as HMENU,
+                module,
+                null(),
+            );
+            (*s).output = CreateWindowExW(
+                0,
+                wide("EDIT").as_ptr(),
+                wide("").as_ptr(),
+                WS_CHILD
+                    | WS_TABSTOP
+                    | WS_VSCROLL
+                    | WS_HSCROLL
+                    | ES_MULTILINE as u32
+                    | ES_READONLY as u32
+                    | ES_AUTOVSCROLL as u32
+                    | ES_AUTOHSCROLL as u32
+                    | ES_NOHIDESEL as u32,
+                0,
+                0,
+                500,
+                180,
+                hwnd,
+                OUTPUT_ID as HMENU,
+                module,
+                null(),
+            );
+            (*s).output_status = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                // SS_LEFTNOWORDWRAP | SS_NOPREFIX | SS_ENDELLIPSIS.
+                WS_CHILD | 0x000C | 0x0080 | 0x4000,
+                0,
+                0,
+                500,
+                22,
+                hwnd,
+                OUTPUT_STATUS_ID as HMENU,
+                module,
+                null(),
+            );
             SetWindowSubclass((*s).edit, Some(edit_proc), 1, hwnd as usize);
             SetWindowSubclass((*s).list, Some(list_proc), 1, hwnd as usize);
             SetWindowSubclass((*s).button, Some(button_proc), 1, hwnd as usize);
-            SendMessageW((*s).edit, EM_SETLIMITTEXT, 256, 0);
+            SetWindowSubclass((*s).output, Some(result_control_proc), 1, hwnd as usize);
+            SetWindowSubclass(
+                (*s).copy_button,
+                Some(result_control_proc),
+                1,
+                hwnd as usize,
+            );
+            SendMessageW((*s).edit, EM_SETLIMITTEXT, 4096, 0);
             SendMessageW(
                 (*s).edit,
                 EM_SETCUEBANNER,
                 1,
-                wide("搜索应用、拼音或首字母").as_ptr() as isize,
+                wide("搜索应用，= 计算，> 运行命令").as_ptr() as isize,
             );
+            theme::control((*s).edit);
+            theme::control((*s).list);
+            theme::control((*s).output);
+            theme::button((*s).copy_button, theme::PRIMARY_BUTTON);
             fonts(hwnd);
             return 0;
         }
@@ -1862,9 +2539,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let id = w & 0xffff;
             let event = (w >> 16) & 0xffff;
             if id == EDIT_ID && event == EN_CHANGE as usize && !(*s).suppress_edit {
-                let mut text = vec![0u16; 258];
+                let mut text =
+                    vec![0u16; GetWindowTextLengthW((*s).edit).clamp(0, 4096) as usize + 1];
                 let len = GetWindowTextW((*s).edit, text.as_mut_ptr(), text.len() as i32);
-                (*s).query = String::from_utf16_lossy(&text[..len.max(0) as usize]);
+                let text = String::from_utf16_lossy(&text[..len.max(0) as usize]);
+                if matches!((*s).page, Page::Home) {
+                    if (*s).input.update(text) {
+                        sync_input_control(hwnd);
+                    }
+                } else {
+                    (*s).input.text = text;
+                }
+                (*s).copied = false;
                 rebuild(hwnd);
             } else if id == LIST_ID && event == LBN_DBLCLK as usize {
                 execute(hwnd);
@@ -1872,6 +2558,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 SetFocus((*s).edit);
             } else if id == MENU_ID && event == BN_CLICKED as usize {
                 menu(hwnd);
+            } else if id == COPY_ID && event == BN_CLICKED as usize {
+                copy_result(hwnd);
             }
             return 0;
         }
@@ -1889,8 +2577,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 VK_RETURN => execute(hwnd),
                 VK_ESCAPE => match (*s).page.clone() {
                     Page::Home => {
-                        navigate(hwnd, Page::Home);
-                        hide(hwnd, true);
+                        if !leave_input_mode(hwnd) {
+                            navigate(hwnd, Page::Home);
+                            hide(hwnd, true);
+                        }
                     }
                     Page::Plugin(_) => navigate(hwnd, Page::Plugins),
                     _ => navigate(hwnd, Page::Home),
@@ -1905,7 +2595,13 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         InvalidateRect((*s).list, null(), 0);
                     }
                 }
-                VK_TAB => menu(hwnd),
+                VK_TAB => {
+                    if (*s).panel.is_some() {
+                        focus_result_control(hwnd);
+                    } else {
+                        menu(hwnd);
+                    }
+                }
                 _ => {}
             }
             return 0;
@@ -1996,8 +2692,25 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             return 1;
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX | WM_CTLCOLORSTATIC => {
-            SetBkColor(w as HDC, color(250, 251, 253));
-            SetTextColor(w as HDC, color(30, 39, 56));
+            if l as HWND == (*s).output || l as HWND == (*s).output_status {
+                SetBkColor(w as HDC, theme::SURFACE);
+                SetTextColor(
+                    w as HDC,
+                    if (*s).panel.as_ref().is_some_and(|panel| panel.error)
+                        && (l as HWND == (*s).output_status
+                            || !(*s).panel.as_ref().unwrap().terminal)
+                    {
+                        theme::DANGER
+                    } else if l as HWND == (*s).output_status {
+                        theme::MUTED
+                    } else {
+                        theme::TEXT
+                    },
+                );
+                return theme::surface_brush() as isize;
+            }
+            SetBkColor(w as HDC, theme::BACKGROUND);
+            SetTextColor(w as HDC, theme::TEXT);
             return (*s).background as isize;
         }
         WM_SIZE => {

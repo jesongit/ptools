@@ -109,9 +109,22 @@ try {
     if(-not $UiOnly) {
     $refresh = Run-Cli @('--refresh-index')
     $cache = Get-Content -LiteralPath (Join-Path $dataRoot 'index.json') -Raw | ConvertFrom-Json
-    Check ($cache.plugins.applications.Count -gt 0) 'Real Windows application discovery'
-    $results.application_count = $cache.plugins.applications.Count
+    $applications = @($cache.plugins.applications | Where-Object { $_.target.kind -in @('path','app') })
+    Check ($applications.Count -gt 0) 'Real Windows application discovery'
+    $results.application_count = $applications.Count
     $results.application_types = @($cache.plugins.applications | Group-Object { $_.target.kind } | ForEach-Object { [ordered]@{ kind=$_.Name; count=$_.Count } })
+    $systemEntries = @($cache.plugins.applications | Where-Object { $_.target.kind -eq 'system' })
+    $results.system_entry_count = $systemEntries.Count
+    $deviceManager = @($systemEntries | Where-Object { $_.id -eq 'system:device-manager' -and $_.target.id -eq 'device-manager' -and $_.title -eq '设备管理器' })
+    Check ($deviceManager.Count -eq 1) 'Application plugin indexes Windows Device Manager as a fixed system target'
+    Check (@($systemEntries | Where-Object { $_.target.id -eq 'display-settings' -and $_.title -eq '显示设置' }).Count -eq 1) 'Application plugin indexes Windows display settings'
+    Check (@($systemEntries | Where-Object { $_.target.id -eq 'downloads' -and $_.title -eq '下载文件夹' }).Count -eq 1) 'Application plugin indexes the Windows Downloads folder'
+    foreach ($query in @('设备管理器','shebeiguanliqi','sbglq','device manager','devmgmt.msc')) {
+        $hits = @((Run-Cli @('--search',$query)).Output | ConvertFrom-Json)
+        $deviceHits = @($hits | Where-Object { $_.id -eq 'system:device-manager' -and $_.target.kind -eq 'system' -and $_.target.id -eq 'device-manager' })
+        Check ($deviceHits.Count -eq 1) "Windows Device Manager search: $query"
+    }
+    Check (@(Get-Process -Name ptools-applications -ErrorAction SilentlyContinue).Count -eq 0) 'Application and system indexing plugin exits after CLI refresh'
     $probe = Join-Path $runRoot 'launch-probe.exe'
     & rustc (Join-Path $PSScriptRoot 'launch-probe.rs') -O -o $probe
     if ($LASTEXITCODE -ne 0) { throw 'Probe build failed' }

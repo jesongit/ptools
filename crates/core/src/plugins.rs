@@ -108,7 +108,9 @@ fn plugin_file(directory: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn load_plugin(directory: &Path) -> Result<Plugin> {
+/// Read and validate a plugin manifest without requiring its executable to exist.
+/// This also supports identifying retired plugins whose program was already removed.
+pub fn load_plugin_manifest(directory: &Path) -> Result<Manifest> {
     let file = plugin_file(directory, "plugin.json")?;
     let size = fs::metadata(&file)
         .map_err(|e| format!("{}: {e}", file.display()))?
@@ -144,7 +146,6 @@ pub fn load_plugin(directory: &Path) -> Result<Plugin> {
             if exe.extension().and_then(|s| s.to_str()) != Some("exe") {
                 return Err("原生插件入口必须是 .exe".into());
             }
-            plugin_file(directory, exe.to_str().ok_or("无效插件入口")?)?;
         }
         Runtime::Config => {
             validate_entries(&manifest.entries)?;
@@ -157,6 +158,20 @@ pub fn load_plugin(directory: &Path) -> Result<Plugin> {
         validate_entries(&action_entries(&manifest))?;
     } else if !manifest.actions.is_empty() {
         return Err("只有交互插件可提供动作".into());
+    }
+    Ok(manifest)
+}
+
+pub fn load_plugin(directory: &Path) -> Result<Plugin> {
+    let manifest = load_plugin_manifest(directory)?;
+    if matches!(manifest.runtime, Runtime::Executable | Runtime::Interactive) {
+        plugin_file(
+            directory,
+            manifest
+                .executable
+                .as_deref()
+                .ok_or("缺少 executable 字段")?,
+        )?;
     }
     Ok(Plugin {
         manifest,

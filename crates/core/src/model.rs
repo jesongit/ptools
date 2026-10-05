@@ -61,6 +61,7 @@ pub enum Target {
     Path { path: String },
     Url { url: String },
     App { app_id: String },
+    System { id: String },
     Plugin { action: String },
 }
 
@@ -163,6 +164,12 @@ pub fn validate_entry(entry: &Entry) -> Result<()> {
                 return Err("无效的插件动作".into());
             }
             action
+        }
+        Target::System { id } => {
+            if crate::system_command(id).is_none() {
+                return Err("未知的 Windows 系统入口".into());
+            }
+            id
         }
     };
     if target.is_empty() || target.len() > 32760 || target.contains('\0') {

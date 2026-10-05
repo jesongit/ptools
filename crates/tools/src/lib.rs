@@ -6,4 +6,3 @@ pub mod interactive;
 pub mod native;
 pub mod ocr;
 pub mod translation;
-pub mod uninstaller;

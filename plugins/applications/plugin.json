@@ -2,8 +2,8 @@
   "schema_version": 1,
   "id": "applications",
   "name": "应用启动",
-  "version": "0.1.0",
-  "description": "发现开始菜单、桌面快捷方式及系统应用，提供名称和拼音搜索。刷新完成后退出。",
+  "version": "0.1.2",
+  "description": "启动应用、Windows 系统工具、设置页面和常用文件夹，支持中文、拼音及命令别名搜索。刷新完成后退出；系统入口需要 ptools 0.1.2 或以上。",
   "runtime": "executable",
   "executable": "ptools-applications.exe"
 }

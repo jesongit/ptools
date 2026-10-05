@@ -2,10 +2,11 @@ use crate::{
     history::History,
     interactive::{Invocation, WM_INVOKE, read_invocations},
     native::*,
-    ocr::Recognition,
+    ocr::{Recognition, TextSelection},
 };
 use image::{AnimationDecoder, Rgba, RgbaImage};
 use ptools_core::{Result, read_json, write_json};
+use ptools_ui as theme;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
@@ -25,7 +26,18 @@ use windows_sys::Win32::{
 
 const WM_IDLE: u32 = WM_APP + 21;
 const WM_OCR: u32 = WM_APP + 22;
+const WM_COMMIT_TEXT: u32 = WM_APP + 23;
+mod long_panel;
+mod text_editor;
 mod toolbar;
+
+const LONG_HOTKEYS: [(i32, u32, u32, usize); 5] = [
+    (301, MOD_NOREPEAT, VK_RETURN as u32, 201),
+    (302, MOD_NOREPEAT, VK_ESCAPE as u32, 205),
+    (303, MOD_NOREPEAT | MOD_CONTROL, 0x43, 201),
+    (304, MOD_NOREPEAT | MOD_CONTROL, 0x54, 202),
+    (305, MOD_NOREPEAT | MOD_CONTROL, 0x53, 203),
+];
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -78,6 +90,7 @@ struct Animation {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Tool {
     Select,
+    PickColor,
     Line,
     Polyline,
     Rect,
@@ -87,7 +100,6 @@ enum Tool {
     Highlight,
     Text,
     Number,
-    Mosaic,
 }
 #[derive(Clone)]
 struct Mark {
@@ -117,6 +129,13 @@ struct View {
     font: HFONT,
     alpha: u8,
     recognition: Option<Recognition>,
+    recognition_origin: [i32; 2],
+    recognition_generation: u64,
+    recognition_pending: bool,
+    recognition_attempted: bool,
+    recognition_error: Option<String>,
+    text_selection_enabled: bool,
+    text_selection: TextSelection,
     selecting_text: bool,
     polyline_active: bool,
     animation: Option<Animation>,
@@ -129,12 +148,26 @@ struct View {
     editing: bool,
     toolbar_window: HWND,
     hover_button: Option<usize>,
+    group_tools: [usize; 3],
     selection_drag: u8,
     selection_origin: RECT,
+    text_editor: Option<text_editor::Editor>,
+}
+struct OcrWork {
+    window: usize,
+    token: usize,
+    generation: u64,
+    origin: [i32; 2],
+    translate: bool,
+    result: Result<(Recognition, Option<String>)>,
 }
 struct LongCapture {
     region: RECT,
     previous: RgbaImage,
+    image: RgbaImage,
+    paused: bool,
+    status: String,
+    hotkeys: Vec<i32>,
 }
 
 unsafe fn app(hwnd: HWND) -> *mut App {
@@ -270,7 +303,7 @@ unsafe fn create_view(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
         class.as_ptr(),
         wide(title).as_ptr(),
-        WS_POPUP,
+        WS_POPUP | WS_CLIPCHILDREN,
         r.left,
         r.top,
         r.right - r.left,
@@ -314,6 +347,13 @@ fn empty_view(image: RgbaImage) -> Box<View> {
         font: null_mut(),
         alpha: 255,
         recognition: None,
+        recognition_origin: [0, 0],
+        recognition_generation: 0,
+        recognition_pending: false,
+        recognition_attempted: false,
+        recognition_error: None,
+        text_selection_enabled: true,
+        text_selection: TextSelection::default(),
         selecting_text: false,
         polyline_active: false,
         animation: None,
@@ -326,8 +366,10 @@ fn empty_view(image: RgbaImage) -> Box<View> {
         editing: false,
         toolbar_window: null_mut(),
         hover_button: None,
+        group_tools: [1, 3, 4],
         selection_drag: 0,
         selection_origin: RECT::default(),
+        text_editor: None,
     })
 }
 unsafe fn store(state: &App, image: &RgbaImage, source: &str) -> Result<()> {
@@ -795,6 +837,67 @@ unsafe fn detect(p: [i32; 2], screen: RECT, detailed: bool) -> RECT {
 unsafe fn rendered(data: &View) -> Result<RgbaImage> {
     render_image(data, true)
 }
+unsafe fn mosaic_stroke(image: &mut RgbaImage, points: &[[i32; 2]], width: i32) {
+    let block = (width * 2).max(6);
+    let diameter = (width * 8).max(16);
+    let mut mask = RgbaImage::new(image.width(), image.height());
+    paint_native(&mut mask, |dc| {
+        let pen = CreatePen(PS_SOLID, diameter, 0xffffff);
+        let brush = CreateSolidBrush(0xffffff);
+        let old_pen = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, brush);
+        MoveToEx(dc, points[0][0], points[0][1], null_mut());
+        for p in points.iter().skip(1) {
+            LineTo(dc, p[0], p[1]);
+        }
+        // Round caps also make a single click paint a complete brush dab.
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        for p in points {
+            Ellipse(
+                dc,
+                p[0] - diameter / 2,
+                p[1] - diameter / 2,
+                p[0] + diameter / 2,
+                p[1] + diameter / 2,
+            );
+        }
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old_brush);
+        DeleteObject(pen);
+        DeleteObject(brush);
+    });
+    let left = (points.iter().map(|p| p[0]).min().unwrap() - diameter).max(0) / block * block;
+    let top = (points.iter().map(|p| p[1]).min().unwrap() - diameter).max(0) / block * block;
+    let right = (points.iter().map(|p| p[0]).max().unwrap() + diameter).min(image.width() as i32);
+    let bottom = (points.iter().map(|p| p[1]).max().unwrap() + diameter).min(image.height() as i32);
+    for y in (top..bottom).step_by(block as usize) {
+        for x in (left..right).step_by(block as usize) {
+            let end_x = (x + block).min(image.width() as i32);
+            let end_y = (y + block).min(image.height() as i32);
+            let mut sum = [0u32; 3];
+            let mut count = 0;
+            for yy in y..end_y {
+                for xx in x..end_x {
+                    let pixel = image.get_pixel(xx as u32, yy as u32);
+                    for c in 0..3 {
+                        sum[c] += pixel[c] as u32;
+                    }
+                    count += 1;
+                }
+            }
+            for yy in y..end_y {
+                for xx in x..end_x {
+                    if mask.get_pixel(xx as u32, yy as u32)[0] != 0 {
+                        let pixel = image.get_pixel_mut(xx as u32, yy as u32);
+                        for c in 0..3 {
+                            pixel[c] = (sum[c] / count) as u8;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 unsafe fn render_image(data: &View, decorate: bool) -> Result<RgbaImage> {
     let mut image = if data.screen.is_some() {
         crop(&data.image, data.selection)?
@@ -818,19 +921,8 @@ unsafe fn render_image(data: &View, decorate: bool) -> Result<RgbaImage> {
         let a = points[0];
         let b = *points.last().unwrap();
         let r = rect(a, b);
-        if mark.tool == Tool::Mosaic {
-            let block = (mark.width * 4).max(8);
-            for y in (r.top.max(0)..r.bottom.min(image.height() as i32)).step_by(block as usize) {
-                for x in (r.left.max(0)..r.right.min(image.width() as i32)).step_by(block as usize)
-                {
-                    let pixel = *image.get_pixel(x as u32, y as u32);
-                    for yy in y..(y + block).min(r.bottom).min(image.height() as i32) {
-                        for xx in x..(x + block).min(r.right).min(image.width() as i32) {
-                            image.put_pixel(xx as u32, yy as u32, pixel);
-                        }
-                    }
-                }
-            }
+        if mark.tool == Tool::Pen && mark.color == toolbar::MOSAIC_COLOR {
+            mosaic_stroke(&mut image, &points, mark.width);
             continue;
         }
         if mark.tool == Tool::Highlight {
@@ -857,6 +949,7 @@ unsafe fn render_image(data: &View, decorate: bool) -> Result<RgbaImage> {
             continue;
         }
         let image_width = image.width() as i32;
+        let image_height = image.height() as i32;
         paint_native(&mut image, |dc| {
             let pen = CreatePen(PS_SOLID, mark.width, mark.color);
             let old_pen = SelectObject(dc, pen);
@@ -916,7 +1009,7 @@ unsafe fn render_image(data: &View, decorate: bool) -> Result<RgbaImage> {
                         left: a[0],
                         top: a[1],
                         right: 4096,
-                        bottom: 4096,
+                        bottom: image_height,
                     };
                     if mark.tool == Tool::Number {
                         let radius = size * (mark.text.len() as i32 + 1) / 3 + 5;
@@ -957,7 +1050,13 @@ unsafe fn render_image(data: &View, decorate: bool) -> Result<RgbaImage> {
                         );
                     } else {
                         r.right = image_width;
-                        DrawTextW(dc, wide(&mark.text).as_ptr(), -1, &mut r, DT_WORDBREAK);
+                        DrawTextW(
+                            dc,
+                            wide(&mark.text).as_ptr(),
+                            -1,
+                            &mut r,
+                            DT_WORDBREAK | DT_NOPREFIX,
+                        );
                     }
                     SelectObject(dc, old);
                     DeleteObject(font);
@@ -1029,7 +1128,7 @@ fn selected_tool(id: usize) -> Option<Tool> {
         5 => Some(Tool::Highlight),
         6 => Some(Tool::Text),
         7 => Some(Tool::Number),
-        8 => Some(Tool::Mosaic),
+        24 => Some(Tool::PickColor),
         17 => Some(Tool::Line),
         18 => Some(Tool::Polyline),
         _ => None,
@@ -1047,10 +1146,15 @@ fn finish_polyline(data: &mut View) {
     }
 }
 unsafe fn run_ocr(hwnd: HWND, data: &mut View, translate: bool) -> Result<()> {
-    if data.working {
+    if data.recognition_pending {
         return Err("正在识别，请等待完成".into());
     }
-    let image = rendered(data)?;
+    let image = render_image(data, false)?;
+    let origin = if data.screen.is_some() {
+        [data.selection.left, data.selection.top]
+    } else {
+        [0, 0]
+    };
     let root = (*data.app).root.clone();
     fs::create_dir_all(root.join("work")).map_err(|e| e.to_string())?;
     let file = root.join("work").join(format!(
@@ -1067,7 +1171,11 @@ unsafe fn run_ocr(hwnd: HWND, data: &mut View, translate: bool) -> Result<()> {
     let controller = (*data.app).hwnd as usize;
     let window = hwnd as usize;
     let token = data.token;
-    data.working = true;
+    let generation = data.recognition_generation;
+    data.recognition_pending = true;
+    data.recognition_attempted = true;
+    data.recognition_error = None;
+    data.working = translate;
     std::thread::spawn(move || {
         use std::{
             io::Read,
@@ -1129,7 +1237,7 @@ unsafe fn run_ocr(hwnd: HWND, data: &mut View, translate: bool) -> Result<()> {
             }
             let recognition: Recognition =
                 serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-            if recognition.text.trim().is_empty() {
+            if translate && recognition.text.trim().is_empty() {
                 return Err("没有识别到文字，请选择更清晰的区域".into());
             }
             let translated = if translate {
@@ -1140,7 +1248,14 @@ unsafe fn run_ocr(hwnd: HWND, data: &mut View, translate: bool) -> Result<()> {
             Ok((recognition, translated))
         })();
         let _ = fs::remove_file(&file);
-        let ptr = Box::into_raw(Box::new((window, token, result)));
+        let ptr = Box::into_raw(Box::new(OcrWork {
+            window,
+            token,
+            generation,
+            origin,
+            translate,
+            result,
+        }));
         unsafe {
             if PostMessageW(controller as HWND, WM_OCR, 0, ptr as isize) == 0 {
                 drop(Box::from_raw(ptr));
@@ -1150,11 +1265,377 @@ unsafe fn run_ocr(hwnd: HWND, data: &mut View, translate: bool) -> Result<()> {
     Ok(())
 }
 
+fn clear_recognition(data: &mut View) {
+    data.recognition_generation = data.recognition_generation.wrapping_add(1);
+    data.recognition = None;
+    data.recognition_attempted = false;
+    data.recognition_error = None;
+    data.text_selection = TextSelection::default();
+    data.selecting_text = false;
+}
+
+unsafe fn text_hit(hwnd: HWND, data: &View, p: [i32; 2]) -> bool {
+    if !data.text_selection_enabled
+        || data.recognition_pending
+        || data.polyline_active
+        || !data.list.is_null()
+        || data.long.is_some()
+        || matches!(data.tool, Tool::Text | Tool::Number | Tool::PickColor)
+        || data.screen.is_some()
+            && (!contains(data.selection, p)
+                || selection_hit(
+                    data.selection,
+                    p,
+                    (6 * GetDpiForWindow(hwnd).max(96) / 96) as i32,
+                ) != 16)
+    {
+        return false;
+    }
+    let p = image_point(hwnd, data, p);
+    data.recognition.as_ref().is_some_and(|r| {
+        r.hit_test([
+            (p[0] - data.recognition_origin[0]) as f32,
+            (p[1] - data.recognition_origin[1]) as f32,
+        ])
+    })
+}
+
+unsafe fn select_text(hwnd: HWND, data: &mut View, p: [i32; 2]) {
+    if let Some(recognition) = &data.recognition {
+        let a = image_point(hwnd, data, data.start);
+        let b = image_point(hwnd, data, p);
+        data.text_selection = recognition.select([
+            (a[0] - data.recognition_origin[0]) as f32,
+            (a[1] - data.recognition_origin[1]) as f32,
+            (b[0] - a[0]) as f32,
+            (b[1] - a[1]) as f32,
+        ]);
+    }
+}
+
+unsafe fn copy_selected_text(hwnd: HWND, data: &View) -> Result<()> {
+    if !data.text_selection.text.is_empty() {
+        copy_text(hwnd, &data.text_selection.text)?;
+    }
+    Ok(())
+}
+
+unsafe fn copy_picked_color(hwnd: HWND, data: &View) -> Result<()> {
+    let p = image_point(hwnd, data, data.point);
+    if p[0] >= 0
+        && p[1] >= 0
+        && p[0] < data.image.width() as i32
+        && p[1] < data.image.height() as i32
+    {
+        let pixel = data.image.get_pixel(p[0] as u32, p[1] as u32);
+        copy_text(
+            hwnd,
+            &color_value(*pixel, &(*data.app).settings.color_format),
+        )?;
+    }
+    Ok(())
+}
+
+fn append_long_frame(long: &mut LongCapture, next: RgbaImage) {
+    if long.paused {
+        return;
+    }
+    let Some(shift) = vertical_shift(&long.previous, &next) else {
+        long.status = "画面未能拼接，请慢速滚动".into();
+        return;
+    };
+    if shift > 0 {
+        let height = long.image.height().saturating_add(shift);
+        if height as u64 * long.image.width() as u64 > 100_000_000 {
+            long.paused = true;
+            long.status = "已达到图片长度上限".into();
+            return;
+        }
+        let extra = image::imageops::crop_imm(&next, 0, next.height() - shift, next.width(), shift);
+        let mut combined = RgbaImage::new(long.image.width(), height);
+        image::imageops::overlay(&mut combined, &long.image, 0, 0);
+        image::imageops::overlay(
+            &mut combined,
+            &extra.to_image(),
+            0,
+            long.image.height() as i64,
+        );
+        long.image = combined;
+    }
+    long.previous = next;
+    long.status = if long.hotkeys.len() == LONG_HOTKEYS.len() {
+        "滚动页面，点击图标完成"
+    } else {
+        "快捷键冲突，请用图标"
+    }
+    .into();
+}
+
+unsafe fn sample_long(hwnd: HWND) {
+    let data = &mut *view(hwnd);
+    if data.working {
+        return;
+    }
+    let Some(long) = &data.long else {
+        return;
+    };
+    if long.paused {
+        return;
+    }
+    let region = long.region;
+    let panel = data.toolbar_window;
+    let hidden = !panel.is_null() && long_panel::overlaps_capture(hwnd, region);
+    long_panel::dismiss_tooltip(hwnd);
+    if hidden {
+        ShowWindow(panel, SW_HIDE);
+        windows_sys::Win32::Graphics::Dwm::DwmFlush();
+    }
+    let result = screenshot(region);
+    if hidden {
+        ShowWindow(panel, SW_SHOWNA);
+    }
+    let data = &mut *view(hwnd);
+    if let Some(long) = &mut data.long {
+        match result {
+            Ok(next) => append_long_frame(long, next),
+            Err(_) => long.status = "暂时无法采样，请重试".into(),
+        }
+    }
+    long_panel::sync(hwnd);
+}
+
+unsafe fn draw_long_frame(dc: HDC, client: RECT, selection: RECT) {
+    FillRect(dc, &client, GetStockObject(BLACK_BRUSH) as HBRUSH);
+    let brush = CreateSolidBrush(theme::ACCENT);
+    // Every border pixel lies outside the half-open capture rectangle.
+    for edge in [
+        RECT {
+            left: selection.left - 2,
+            top: selection.top - 2,
+            right: selection.left,
+            bottom: selection.bottom + 2,
+        },
+        RECT {
+            left: selection.right,
+            top: selection.top - 2,
+            right: selection.right + 2,
+            bottom: selection.bottom + 2,
+        },
+        RECT {
+            left: selection.left,
+            top: selection.top - 2,
+            right: selection.right,
+            bottom: selection.top,
+        },
+        RECT {
+            left: selection.left,
+            top: selection.bottom,
+            right: selection.right,
+            bottom: selection.bottom + 2,
+        },
+    ] {
+        FillRect(dc, &edge, brush);
+    }
+    DeleteObject(brush);
+}
+
+unsafe fn start_long(hwnd: HWND) -> Result<()> {
+    let data = &mut *view(hwnd);
+    let Some(screen) = data.screen else {
+        return Ok(());
+    };
+    if (*data.app)
+        .windows
+        .iter()
+        .any(|&window| window != hwnd as usize && (*view(window as HWND)).long.is_some())
+    {
+        return Err("请先完成当前长截图".into());
+    }
+    let selection = data.selection;
+    let region = RECT {
+        left: screen.left + selection.left,
+        top: screen.top + selection.top,
+        right: screen.left + selection.right,
+        bottom: screen.top + selection.bottom,
+    };
+    let previous = crop(&data.image, selection)?;
+    let image = render_image(data, false)?;
+    clear_recognition(data);
+    data.tool = Tool::Select;
+    data.hover_button = None;
+    data.long = Some(LongCapture {
+        region,
+        previous,
+        image,
+        paused: false,
+        status: "滚动页面，点击图标完成".into(),
+        hotkeys: Vec::new(),
+    });
+    ShowWindow(hwnd, SW_HIDE);
+    windows_sys::Win32::Graphics::Dwm::DwmFlush();
+    let target = GetAncestor(
+        WindowFromPoint(POINT {
+            x: (region.left + region.right) / 2,
+            y: (region.top + region.bottom) / 2,
+        }),
+        GA_ROOT,
+    );
+    SetWindowLongPtrW(
+        hwnd,
+        GWL_EXSTYLE,
+        GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) as isize,
+    );
+    SetLayeredWindowAttributes(hwnd, 0, 255, LWA_COLORKEY | LWA_ALPHA);
+    SetWindowTextW(
+        hwnd,
+        wide("ptools 长截图 · 滚动页面 · Enter复制 · Esc取消").as_ptr(),
+    );
+    InvalidateRect(hwnd, null(), 0);
+    ShowWindow(hwnd, SW_SHOWNA);
+    UpdateWindow(hwnd);
+    long_panel::sync(hwnd);
+    if data.toolbar_window.is_null() {
+        DestroyWindow(hwnd);
+        return Err("无法创建长截图操作栏".into());
+    }
+    register_long_keys(hwnd);
+    SetTimer(hwnd, 3, 500, None);
+    if !target.is_null() {
+        SetForegroundWindow(target);
+    }
+    raise_long(hwnd);
+    Ok(())
+}
+
+unsafe fn raise_long(hwnd: HWND) {
+    // Activating an existing topmost target can move it above our frame.
+    // Restore the capture UI order while keeping keyboard focus on the page.
+    SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    long_panel::sync(hwnd);
+}
+
+unsafe fn register_long_keys(hwnd: HWND) {
+    let data = &mut *view(hwnd);
+    for &(id, modifiers, key, _) in &LONG_HOTKEYS {
+        if RegisterHotKey(hwnd, id, modifiers, key) != 0 {
+            data.long.as_mut().unwrap().hotkeys.push(id);
+        }
+    }
+    if data.long.as_ref().unwrap().hotkeys.len() != LONG_HOTKEYS.len() {
+        data.long.as_mut().unwrap().status = "快捷键冲突，请用图标".into();
+        long_panel::sync(hwnd);
+    }
+}
+
+unsafe fn unregister_long_keys(hwnd: HWND) {
+    if let Some(long) = &mut (*view(hwnd)).long {
+        for id in long.hotkeys.drain(..) {
+            UnregisterHotKey(hwnd, id);
+        }
+    }
+}
+
+unsafe fn finish_long(hwnd: HWND, id: usize) -> Result<()> {
+    if (*view(hwnd)).working {
+        return Ok(());
+    }
+    if id == 205 || id == 100 {
+        DestroyWindow(hwnd);
+        return Ok(());
+    }
+    if id == 204 {
+        let data = &mut *view(hwnd);
+        if let Some(long) = &mut data.long {
+            long.paused = !long.paused;
+            long.status = if long.paused {
+                "已暂停"
+            } else {
+                "滚动页面，点击图标完成"
+            }
+            .into();
+        }
+        long_panel::sync(hwnd);
+        return Ok(());
+    }
+    if !(201..=203).contains(&id) {
+        return Ok(());
+    }
+    sample_long(hwnd);
+    KillTimer(hwnd, 3);
+    let foreground = GetForegroundWindow();
+    unregister_long_keys(hwnd);
+    let data = &mut *view(hwnd);
+    data.working = true;
+    EnableWindow(data.toolbar_window, 0);
+    let image = data.long.as_ref().unwrap().image.clone();
+    let result = (|| -> Result<bool> {
+        match id {
+            203 => {
+                let Some(path) = save_dialog(hwnd) else {
+                    return Ok(false);
+                };
+                save_image(&path, &image)?;
+                store(&*data.app, &image, "长截图")?;
+            }
+            202 => {
+                store(&*data.app, &image, "长截图")?;
+                pin(&mut *data.app, image.clone(), None, false)?;
+            }
+            _ => {
+                store(&*data.app, &image, "长截图")?;
+                copy_image(hwnd, &image)?;
+            }
+        }
+        Ok(true)
+    })();
+    if result.as_ref().is_ok_and(|finished| *finished) {
+        DestroyWindow(hwnd);
+    } else {
+        if let Err(error) = &result {
+            alert(hwnd, error);
+        }
+        if IsWindow(hwnd) == 0 {
+            return Ok(());
+        }
+        let data = &mut *view(hwnd);
+        data.working = false;
+        EnableWindow(data.toolbar_window, 1);
+        register_long_keys(hwnd);
+        SetTimer(hwnd, 3, 500, None);
+        if IsWindow(foreground) != 0 {
+            SetForegroundWindow(foreground);
+        }
+        raise_long(hwnd);
+    }
+    Ok(())
+}
+
 unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
     let data = &mut *view(hwnd);
+    if data.long.is_some() {
+        return finish_long(
+            hwnd,
+            match id {
+                9 => 201,
+                10 => 202,
+                11 => 203,
+                _ => id,
+            },
+        );
+    }
     if !toolbar::enabled(data, id) {
         return Ok(());
     }
+    text_editor::finish(hwnd, data, true);
+    toolbar::remember_tool(data, id);
     if data.dragging {
         data.dragging = false;
         data.selecting_text = false;
@@ -1163,6 +1644,9 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
     if let Some(tool) = selected_tool(id) {
         finish_polyline(data);
         data.tool = tool;
+        if tool != Tool::Pen && data.color == toolbar::MOSAIC_COLOR {
+            data.color = toolbar::COLORS[0];
+        }
         if tool == Tool::Highlight {
             data.color = toolbar::COLORS[2];
         }
@@ -1179,6 +1663,15 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
     }
     let state = &mut *data.app;
     match id {
+        12 => {
+            data.text_selection_enabled = !data.text_selection_enabled;
+            data.text_selection = TextSelection::default();
+            data.selecting_text = false;
+            if data.text_selection_enabled {
+                data.recognition_attempted = data.recognition.is_some();
+                data.recognition_error = None;
+            }
+        }
         9 => {
             let image = rendered(data)?;
             copy_image(hwnd, &image)?;
@@ -1207,8 +1700,8 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
                 }
             }
         }
-        12 | 13 => {
-            run_ocr(hwnd, data, id == 13)?;
+        13 => {
+            run_ocr(hwnd, data, true)?;
         }
         14 => {
             let image = rendered(data)?;
@@ -1241,100 +1734,51 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
                 }
             }
         }
-        15 => {
-            if let Some(screen) = data.screen {
-                let selection = data.selection;
-                let region = RECT {
-                    left: screen.left + selection.left,
-                    top: screen.top + selection.top,
-                    right: screen.left + selection.right,
-                    bottom: screen.top + selection.bottom,
-                };
-                let previous = crop(&data.image, selection)?;
-                let image = render_image(data, false)?;
-                let mut next = empty_view(image.clone());
-                next.long = Some(LongCapture { region, previous });
-                let width = 500;
-                let height = 220;
-                let candidates = [
-                    [region.right + 8, region.top],
-                    [region.left - width - 8, region.top],
-                    [region.left, region.bottom + 8],
-                    [region.left, region.top - height - 8],
-                ];
-                let [x, y] = candidates
-                    .into_iter()
-                    .find(|[x, y]| {
-                        *x >= screen.left
-                            && *y >= screen.top
-                            && *x + width <= screen.right
-                            && *y + height <= screen.bottom
-                    })
-                    .unwrap_or([screen.left, screen.top]);
-                let long_hwnd = create_view(
-                    state,
-                    next,
-                    "长截图：滚动目标窗口，Enter结束，Esc取消",
-                    RECT {
-                        left: x,
-                        top: y,
-                        right: x + width,
-                        bottom: y + height,
-                    },
-                    false,
-                );
-                if !long_hwnd.is_null() {
-                    child(
-                        long_hwnd,
-                        "BUTTON",
-                        "完成并复制",
-                        WS_TABSTOP,
-                        201,
-                        [12, 174, 130, 34],
-                    );
-                    child(
-                        long_hwnd,
-                        "BUTTON",
-                        "完成并贴图",
-                        WS_TABSTOP,
-                        202,
-                        [154, 174, 130, 34],
-                    );
-                    child(
-                        long_hwnd,
-                        "BUTTON",
-                        "完成并保存",
-                        WS_TABSTOP,
-                        203,
-                        [296, 174, 130, 34],
-                    );
-                    SetTimer(long_hwnd, 3, 500, None);
-                    SetForegroundWindow(GetShellWindow());
-                }
-                DestroyWindow(hwnd);
-            }
-        }
+        15 => start_long(hwnd)?,
         16 => {
             settings(state, hwnd)?;
         }
         21 => {
+            clear_recognition(data);
             data.polyline_active = false;
             if let Some(mark) = data.marks.pop() {
                 data.redo.push(mark);
             }
         }
         22 => {
+            clear_recognition(data);
             data.polyline_active = false;
             if let Some(mark) = data.redo.pop() {
                 data.marks.push(mark);
             }
         }
-        23 => toolbar::more(hwnd),
+        25 => copy_selected_text(hwnd, data)?,
         30..=37 => data.color = toolbar::COLORS[id - 30],
+        38 => {
+            finish_polyline(data);
+            data.tool = Tool::Pen;
+            data.color = toolbar::MOSAIC_COLOR;
+            if data.screen.is_none() {
+                data.editing = true;
+                toolbar::sync_pin(hwnd);
+            }
+        }
         40..=42 => data.stroke = [2, 3, 6][id - 40],
         100 => {
             DestroyWindow(hwnd);
             return Ok(());
+        }
+        101 => {
+            if let Some(path) = &data.file {
+                ShellExecuteW(
+                    hwnd,
+                    wide("open").as_ptr(),
+                    wide(&path.to_string_lossy()).as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                );
+            }
         }
         19 if data.screen.is_some() => {
             let r = data.selection;
@@ -1366,6 +1810,7 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
                     right: n[0] + n[2],
                     bottom: n[1] + n[3],
                 };
+                clear_recognition(data);
                 if values[4] == "true" {
                     let screen = data.screen.unwrap();
                     let region = [n[0] + screen.left, n[1] + screen.top, n[2], n[3]];
@@ -1378,6 +1823,7 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
             }
         }
         20 if data.screen.is_some() => {
+            clear_recognition(data);
             data.selection = RECT {
                 left: 0,
                 top: 0,
@@ -1469,7 +1915,7 @@ unsafe fn settings(state: &mut App, parent: HWND) -> Result<()> {
 
 unsafe fn history(state: &mut App) -> Result<()> {
     let items = History::new(&state.root, state.settings.history_days)?.list()?;
-    let mut data = empty_view(RgbaImage::from_pixel(720, 420, Rgba([250, 250, 250, 255])));
+    let mut data = empty_view(RgbaImage::from_pixel(720, 420, Rgba([25, 27, 30, 255])));
     data.history = items;
     let hwnd = create_view(
         state,
@@ -1719,14 +2165,13 @@ unsafe extern "system" fn controller_proc(
             return 0;
         }
         WM_OCR => {
-            let work =
-                Box::from_raw(l as *mut (usize, usize, Result<(Recognition, Option<String>)>));
-            let (window, token, result) = *work;
+            let work = Box::from_raw(l as *mut OcrWork);
+            let (window, token) = (work.window, work.token);
             if (*state).windows.contains(&window)
                 && !view(window as HWND).is_null()
                 && (*view(window as HWND)).token == token
             {
-                let ptr = Box::into_raw(Box::new(result));
+                let ptr = Box::into_raw(work);
                 SendMessageW(window as HWND, WM_OCR, token, ptr as isize);
             }
             return 0;
@@ -1770,6 +2215,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 0,
                 wide("Microsoft YaHei").as_ptr(),
             );
+            SetTimer(hwnd, 6, 250, None);
             return 0;
         }
         WM_PAINT | WM_PRINTCLIENT => {
@@ -1781,6 +2227,13 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             };
             let mut client = RECT::default();
             GetClientRect(hwnd, &mut client);
+            if data.long.is_some() {
+                draw_long_frame(target_dc, client, data.selection);
+                if message == WM_PAINT {
+                    EndPaint(hwnd, &paint);
+                }
+                return 0;
+            }
             let dc = CreateCompatibleDC(target_dc);
             let bitmap =
                 CreateCompatibleBitmap(target_dc, client.right.max(1), client.bottom.max(1));
@@ -1808,7 +2261,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 );
             }
             if data.screen.is_none() && data.long.is_none() && data.list.is_null() {
-                let brush = CreateSolidBrush(0x72675c);
+                let brush = CreateSolidBrush(theme::BORDER);
                 FrameRect(dc, &client, brush);
                 DeleteObject(brush);
                 let inner = RECT {
@@ -1817,7 +2270,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     right: client.right - 1,
                     bottom: client.bottom - 1,
                 };
-                FrameRect(dc, &inner, GetStockObject(WHITE_BRUSH) as HBRUSH);
+                FrameRect(dc, &inner, theme::surface_brush());
             }
             if data.screen.is_some() {
                 let selection = if data.selection.right > data.selection.left {
@@ -1879,7 +2332,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 SelectObject(shade, previous);
                 DeleteObject(black);
                 DeleteDC(shade);
-                let pen = CreatePen(PS_SOLID, 2, 0xe09020);
+                let pen = CreatePen(PS_SOLID, 2, theme::ACCENT);
                 let old_pen = SelectObject(dc, pen);
                 let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
                 Rectangle(
@@ -1907,7 +2360,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     );
                 }
                 if data.selection.right > data.selection.left {
-                    let brush = CreateSolidBrush(0xe09020);
+                    let brush = CreateSolidBrush(theme::ACCENT);
                     FrameRect(dc, &selection, brush);
                     let mid_x = (selection.left + selection.right) / 2;
                     let mid_y = (selection.top + selection.bottom) / 2;
@@ -1927,7 +2380,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                             right: x + 4,
                             bottom: y + 4,
                         };
-                        FillRect(dc, &r, GetStockObject(WHITE_BRUSH) as HBRUSH);
+                        FillRect(dc, &r, theme::surface_brush());
+                        SetTextColor(dc, theme::TEXT);
+                        SetBkMode(dc, TRANSPARENT as i32);
                         FrameRect(dc, &r, brush);
                     }
                     DeleteObject(brush);
@@ -1955,7 +2410,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     );
                 }
                 let p = data.point;
-                if data.selection.right <= data.selection.left
+                if (data.selection.right <= data.selection.left || data.tool == Tool::PickColor)
                     && p[0] >= 0
                     && p[1] >= 0
                     && p[0] < data.image.width() as i32
@@ -1970,7 +2425,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     };
                     r.right = r.left + 280;
                     r.bottom = r.top + 136;
-                    FillRect(dc, &r, GetStockObject(WHITE_BRUSH) as HBRUSH);
+                    FillRect(dc, &r, theme::surface_brush());
+                    SetTextColor(dc, theme::TEXT);
+                    SetBkMode(dc, TRANSPARENT as i32);
                     let zoom = image::imageops::crop_imm(
                         &data.image,
                         (p[0] - 5).max(0) as u32,
@@ -1993,7 +2450,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                         GetStockObject(BLACK_BRUSH) as HBRUSH,
                     );
                     let label = format!(
-                        "{}×{}\n{}\nC 复制颜色",
+                        "{}×{}\n{}\n单击复制颜色",
                         selection.right - selection.left,
                         selection.bottom - selection.top,
                         color_value(*pixel, &(*data.app).settings.color_format)
@@ -2004,44 +2461,29 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     DrawTextW(dc, wide(&label).as_ptr(), -1, &mut r, DT_LEFT);
                 }
             }
-            if data.screen.is_none()
-                && data.selecting_text
-                && let Some(recognition) = &data.recognition
-            {
-                let selection = rect(data.start, data.point);
-                let sx = (client.right - 4) as f32 / data.image.width() as f32;
-                let sy = (client.bottom - 4) as f32 / data.image.height() as f32;
-                let brush = CreateSolidBrush(0xe09020);
-                for word in &recognition.words {
-                    let [x, y, width, height] = word.bounds;
+            if data.text_selection_enabled {
+                let (sx, sy, padding) = if data.screen.is_some() {
+                    (1.0, 1.0, 0)
+                } else {
+                    (
+                        (client.right - 4) as f32 / data.image.width() as f32,
+                        (client.bottom - 4) as f32 / data.image.height() as f32,
+                        2,
+                    )
+                };
+                let brush = CreateSolidBrush(theme::ACCENT);
+                for &[x, y, width, height] in &data.text_selection.bounds {
+                    let x = x + data.recognition_origin[0] as f32;
+                    let y = y + data.recognition_origin[1] as f32;
                     let r = RECT {
-                        left: 2 + (x * sx) as i32,
-                        top: 2 + (y * sy) as i32,
-                        right: 2 + ((x + width) * sx) as i32,
-                        bottom: 2 + ((y + height) * sy) as i32,
+                        left: padding + (x * sx) as i32,
+                        top: padding + (y * sy) as i32,
+                        right: padding + ((x + width) * sx).ceil() as i32,
+                        bottom: padding + ((y + height) * sy).ceil() as i32,
                     };
-                    let mut overlap = RECT::default();
-                    if IntersectRect(&mut overlap, &r, &selection) != 0 {
-                        FrameRect(dc, &r, brush);
-                    }
+                    FrameRect(dc, &r, brush);
                 }
                 DeleteObject(brush);
-            }
-            if data.long.is_some() {
-                let mut r = RECT {
-                    left: 12,
-                    top: 12,
-                    right: 480,
-                    bottom: 55,
-                };
-                FillRect(dc, &r, GetStockObject(WHITE_BRUSH) as HBRUSH);
-                DrawTextW(
-                    dc,
-                    wide("滚动目标窗口进行拼接，Enter结束，Esc取消").as_ptr(),
-                    -1,
-                    &mut r,
-                    DT_LEFT,
-                );
             }
             if toolbar::visible(data) {
                 toolbar::draw(dc, data, &toolbar::layout(hwnd, data));
@@ -2067,12 +2509,14 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_LBUTTONDOWN => {
+            if data.long.is_some() {
+                return 0;
+            }
             let p = point(l);
+            text_editor::finish(hwnd, data, true);
             let bar = toolbar::layout(hwnd, data);
             if toolbar::visible(data) && contains(bar.bounds, p) {
-                if let Some(id) = bar.hit(p)
-                    && let Err(e) = command(hwnd, id)
-                {
+                if let Err(e) = toolbar::click(hwnd, hwnd, p) {
                     alert(hwnd, &e);
                 }
                 if IsWindow(hwnd) != 0 {
@@ -2083,7 +2527,35 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             if data.screen.is_some() && data.tool != Tool::Select && !contains(data.selection, p) {
                 return 0;
             }
+            if data.working {
+                return 0;
+            }
+            if text_hit(hwnd, data, p) {
+                data.dragging = true;
+                data.selecting_text = true;
+                data.start = p;
+                data.point = p;
+                select_text(hwnd, data, p);
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            data.text_selection = TextSelection::default();
+            if data.tool == Tool::Text {
+                text_editor::begin(hwnd, data, p);
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            if data.tool == Tool::PickColor {
+                data.point = p;
+                if let Err(e) = copy_picked_color(hwnd, data) {
+                    alert(hwnd, &e);
+                }
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
             if data.tool == Tool::Polyline {
+                clear_recognition(data);
                 let p = image_point(hwnd, data, p);
                 if data.polyline_active {
                     if let Some(mark) = data.marks.last_mut() {
@@ -2104,7 +2576,8 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
-            if data.screen.is_some() || data.tool != Tool::Select || data.recognition.is_some() {
+            if data.screen.is_some() || data.tool != Tool::Select {
+                clear_recognition(data);
                 data.dragging = true;
                 data.start = p;
                 SetCapture(hwnd);
@@ -2120,29 +2593,23 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                         data.marks.clear();
                         data.redo.clear();
                     }
-                } else if data.recognition.is_some() && data.tool == Tool::Select {
-                    data.selecting_text = true;
                 } else {
                     let mut label = String::new();
-                    if data.tool == Tool::Text {
-                        data.dragging = false;
-                        ReleaseCapture();
-                        let Some(value) =
-                            prompt(hwnd, "标注文字", "", false).filter(|s| !s.trim().is_empty())
-                        else {
-                            return 0;
-                        };
-                        label = value;
-                    } else if data.tool == Tool::Number {
+                    if data.tool == Tool::Number {
                         data.dragging = false;
                         ReleaseCapture();
                         label = (data.marks.iter().filter(|m| m.tool == Tool::Number).count() + 1)
                             .to_string();
                     }
                     data.redo.clear();
+                    let image_p = image_point(hwnd, data, p);
                     data.marks.push(Mark {
                         tool: data.tool,
-                        points: vec![image_point(hwnd, data, p), image_point(hwnd, data, p)],
+                        points: if matches!(data.tool, Tool::Pen | Tool::Highlight) {
+                            vec![image_p]
+                        } else {
+                            vec![image_p, image_p]
+                        },
                         text: label,
                         color: data.color,
                         width: data.stroke,
@@ -2156,6 +2623,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_MOUSEMOVE => {
+            if data.long.is_some() {
+                return 0;
+            }
             let p = point(l);
             let image_p = image_point(hwnd, data, p);
             data.point = p;
@@ -2186,7 +2656,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 return 0;
             }
             if data.dragging {
-                if data.tool == Tool::Select && data.screen.is_some() {
+                if data.selecting_text {
+                    select_text(hwnd, data, p);
+                } else if data.tool == Tool::Select && data.screen.is_some() {
                     if data.selection_drag != 0 {
                         adjust_selection(data, p);
                         InvalidateRect(hwnd, null(), 0);
@@ -2240,9 +2712,36 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             InvalidateRect(hwnd, null(), 0);
             return 0;
         }
+        WM_SETCURSOR if l as u32 & 0xffff == HTCLIENT => {
+            let mut cursor = POINT::default();
+            GetCursorPos(&mut cursor);
+            ScreenToClient(hwnd, &mut cursor);
+            let p = [cursor.x, cursor.y];
+            let over_toolbar =
+                toolbar::visible(data) && contains(toolbar::layout(hwnd, data).bounds, p);
+            SetCursor(LoadCursorW(
+                null_mut(),
+                if over_toolbar {
+                    IDC_ARROW
+                } else if data.working {
+                    IDC_WAIT
+                } else if text_hit(hwnd, data, p) || data.selecting_text || data.tool == Tool::Text
+                {
+                    IDC_IBEAM
+                } else if data.screen.is_some() || data.tool != Tool::Select {
+                    IDC_CROSS
+                } else {
+                    IDC_ARROW
+                },
+            ));
+            return 1;
+        }
         WM_LBUTTONUP => {
+            if data.long.is_some() {
+                return 0;
+            }
             let p = point(l);
-            if data.dragging && data.tool != Tool::Select {
+            if data.dragging && data.tool != Tool::Select && !data.selecting_text {
                 let mut end = image_point(hwnd, data, p);
                 if data.screen.is_some() {
                     end = [
@@ -2251,12 +2750,20 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     ];
                 }
                 if let Some(mark) = data.marks.last_mut() {
-                    *mark.points.last_mut().unwrap() = end;
+                    if matches!(mark.tool, Tool::Pen | Tool::Highlight) {
+                        if mark.points.last() != Some(&end) {
+                            mark.points.push(end);
+                        }
+                    } else {
+                        *mark.points.last_mut().unwrap() = end;
+                    }
                 }
             }
-            let finish_quick = data.quick && data.dragging && data.tool == Tool::Select;
+            let finish_quick =
+                data.quick && data.dragging && data.tool == Tool::Select && !data.selecting_text;
             if data.dragging
                 && data.tool == Tool::Select
+                && !data.selecting_text
                 && data.screen.is_some()
                 && data.selection_drag != 0
             {
@@ -2264,6 +2771,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             }
             if data.dragging
                 && data.tool == Tool::Select
+                && !data.selecting_text
                 && data.screen.is_some()
                 && data.selection_drag == 0
             {
@@ -2285,6 +2793,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             }
             if data.dragging
                 && data.tool == Tool::Select
+                && !data.selecting_text
                 && data.screen.is_some()
                 && data.selection_drag == 0
                 && (p[0] - data.start[0]).abs() + (p[1] - data.start[1]).abs() < 4
@@ -2312,26 +2821,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 return 0;
             }
             if data.selecting_text {
-                if let Some(recognition) = &data.recognition {
-                    let mut client = RECT::default();
-                    GetClientRect(hwnd, &mut client);
-                    let r = rect(data.start, p);
-                    let sx = data.image.width() as f32 / (client.right - 4).max(1) as f32;
-                    let sy = data.image.height() as f32 / (client.bottom - 4).max(1) as f32;
-                    let text = recognition
-                        .words
-                        .iter()
-                        .filter(|word| {
-                            let [x, y, width, height] = word.bounds;
-                            x + width >= (r.left - 2) as f32 * sx
-                                && x <= (r.right - 2) as f32 * sx
-                                && y + height >= (r.top - 2) as f32 * sy
-                                && y <= (r.bottom - 2) as f32 * sy
-                        })
-                        .map(|word| word.text.as_str())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let _ = copy_text(hwnd, &crate::ocr::normalize(&text));
+                select_text(hwnd, data, p);
+                if let Err(e) = copy_selected_text(hwnd, data) {
+                    alert(hwnd, &e);
                 }
                 data.selecting_text = false;
             }
@@ -2341,8 +2833,19 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_LBUTTONDBLCLK => {
+            if data.long.is_some() {
+                return 0;
+            }
             if data.polyline_active {
                 finish_polyline(data);
+                InvalidateRect(hwnd, null(), 0);
+                return 0;
+            }
+            let p = point(l);
+            if text_hit(hwnd, data, p) {
+                data.start = p;
+                select_text(hwnd, data, p);
+                let _ = copy_selected_text(hwnd, data);
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
@@ -2383,7 +2886,12 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_MOVE | WM_SIZE => {
-            toolbar::sync_pin(hwnd);
+            if data.long.is_some() {
+                long_panel::sync(hwnd);
+            } else {
+                toolbar::sync_pin(hwnd);
+            }
+            text_editor::resize(hwnd, data);
             InvalidateRect(hwnd, null(), 0);
             return 0;
         }
@@ -2417,16 +2925,20 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         }
         WM_CAPTURECHANGED => {
             data.dragging = false;
+            data.selecting_text = false;
             InvalidateRect(hwnd, null(), 0);
             return 0;
         }
         WM_CONTEXTMENU => {
+            if data.long.is_some() {
+                return 0;
+            }
             let popup = CreatePopupMenu();
             for (id, label) in [
                 (9, "复制图片"),
                 (10, "另建贴图"),
                 (11, "另存为"),
-                (12, "识别并选择文字"),
+                (12, "文字框选开关"),
                 (13, "翻译"),
                 (14, "识别二维码"),
                 (1, "矩形标注"),
@@ -2436,7 +2948,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 (5, "荧光笔"),
                 (6, "文字标注"),
                 (7, "序号"),
-                (8, "马赛克"),
+                (38, "画笔马赛克"),
+                (24, "取色"),
+                (25, "复制选中文字"),
                 (17, "直线标注"),
                 (18, "折线标注"),
                 (0, "框选 / 移动"),
@@ -2449,6 +2963,11 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 AppendMenuW(
                     popup,
                     MF_STRING
+                        | if id == 12 && data.text_selection_enabled {
+                            MF_CHECKED
+                        } else {
+                            0
+                        }
                         | if toolbar::enabled(data, id) {
                             0
                         } else {
@@ -2473,20 +2992,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 null(),
             );
             DestroyMenu(popup);
-            if id == 101 {
-                if let Some(path) = &data.file {
-                    ShellExecuteW(
-                        hwnd,
-                        wide("open").as_ptr(),
-                        wide(&path.to_string_lossy()).as_ptr(),
-                        null(),
-                        null(),
-                        SW_SHOWNORMAL,
-                    );
-                }
-            } else if id == 100 {
-                DestroyWindow(hwnd);
-            } else if id != 0
+            if id != 0
                 && let Err(e) = command(hwnd, id as usize)
             {
                 alert(hwnd, &e);
@@ -2495,9 +3001,10 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         }
         WM_COMMAND
             if w >> 16 == 0
-                && ((0..=23).contains(&(w & 0xffff))
+                && ((0..=25).contains(&(w & 0xffff))
                     || (30..=42).contains(&(w & 0xffff))
-                    || w == 100) =>
+                    || w == 100
+                    || w == 101) =>
         {
             if let Err(e) = command(hwnd, w & 0xffff) {
                 alert(hwnd, &e);
@@ -2514,6 +3021,55 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_KEYDOWN => {
             let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
             let shift = GetKeyState(VK_SHIFT as i32) < 0;
+            if data.long.is_some() {
+                let id = match w as u16 {
+                    VK_ESCAPE => 205,
+                    VK_RETURN => 201,
+                    0x43 if ctrl => 201,
+                    0x54 if ctrl => 202,
+                    0x53 if ctrl => 203,
+                    _ => return 0,
+                };
+                if let Err(e) = finish_long(hwnd, id) {
+                    alert(hwnd, &e);
+                }
+                return 0;
+            }
+            if data.text_selection_enabled {
+                match w as u16 {
+                    0x43 if ctrl && !data.text_selection.text.is_empty() => {
+                        if !data.working
+                            && let Err(e) = copy_selected_text(hwnd, data)
+                        {
+                            alert(hwnd, &e);
+                        }
+                        return 0;
+                    }
+                    VK_RETURN if !data.text_selection.text.is_empty() => {
+                        if !data.working
+                            && let Err(e) = copy_selected_text(hwnd, data)
+                        {
+                            alert(hwnd, &e);
+                        }
+                        return 0;
+                    }
+                    0x41 if ctrl
+                        && (data.screen.is_none() || !data.text_selection.text.is_empty()) =>
+                    {
+                        if !data.working
+                            && let Some(recognition) = &data.recognition
+                        {
+                            data.text_selection = recognition.select_all();
+                        }
+                        InvalidateRect(hwnd, null(), 0);
+                        if !data.toolbar_window.is_null() {
+                            InvalidateRect(data.toolbar_window, null(), 0);
+                        }
+                        return 0;
+                    }
+                    _ => {}
+                }
+            }
             let id = match w as u16 {
                 VK_ESCAPE => {
                     if data.polyline_active {
@@ -2530,11 +3086,16 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     return 0;
                 }
                 VK_RETURN => 9,
-                VK_SPACE if data.screen.is_none() => {
+                VK_SPACE if data.screen.is_none() && !data.working => {
                     finish_polyline(data);
                     data.editing = !data.editing;
                     data.tool = if data.editing {
-                        Tool::Rect
+                        if data.group_tools[0] == 2 {
+                            Tool::Ellipse
+                        } else {
+                            toolbar::remember_tool(data, 1);
+                            Tool::Rect
+                        }
                     } else {
                         Tool::Select
                     };
@@ -2560,24 +3121,14 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 0x48 => 5,
                 0x54 => 6,
                 0x4e => 7,
-                0x4d => 8,
+                0x4d => 38,
                 0x4c => 17,
                 0x46 => 18,
-                0x43 if data.screen.is_some() => {
-                    let p = data.point;
-                    if p[0] >= 0
-                        && p[1] >= 0
-                        && p[0] < data.image.width() as i32
-                        && p[1] < data.image.height() as i32
-                    {
-                        let pixel = data.image.get_pixel(p[0] as u32, p[1] as u32);
-                        let value = color_value(*pixel, &(*data.app).settings.color_format);
-                        let _ = copy_text(hwnd, &value);
-                        DestroyWindow(hwnd);
-                    }
-                    return 0;
-                }
-                VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN if data.screen.is_some() => {
+                0x43 => 24,
+                VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN
+                    if data.screen.is_some() && !data.working && data.tool == Tool::Select =>
+                {
+                    clear_recognition(data);
                     let dx = if w as u16 == VK_LEFT {
                         -1
                     } else if w as u16 == VK_RIGHT {
@@ -2614,23 +3165,19 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
                 _ => return DefWindowProcW(hwnd, message, w, l),
             };
-            if data.long.is_some() && w as u16 == VK_RETURN {
-                KillTimer(hwnd, 3);
-                data.long = None;
-                let image = data.image.clone();
-                let state = &mut *data.app;
-                let _ = store(state, &image, "长截图");
-                let _ = copy_image(hwnd, &image);
-                DestroyWindow(hwnd);
-            } else if let Err(e) = command(hwnd, id) {
+            if let Err(e) = command(hwnd, id) {
                 alert(hwnd, &e);
             }
             return 0;
         }
         WM_OCR => {
             data.working = false;
-            let result = Box::from_raw(l as *mut Result<(Recognition, Option<String>)>);
-            match *result {
+            data.recognition_pending = false;
+            let work = Box::from_raw(l as *mut OcrWork);
+            if work.generation != data.recognition_generation {
+                return 0;
+            }
+            match work.result {
                 Ok((recognition, translated)) => {
                     if let Some(translated) = translated {
                         let _ = prompt(
@@ -2640,24 +3187,33 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                             true,
                         );
                     } else {
-                        let _ = copy_text(hwnd, &recognition.text);
-                        if data.screen.is_some() {
-                            let image = rendered(data).unwrap_or_else(|_| data.image.clone());
-                            if let Ok(pin) = pin(&mut *data.app, image, None, true) {
-                                (*view(pin)).recognition = Some(recognition);
-                            }
-                            DestroyWindow(hwnd);
-                        } else {
-                            data.tool = Tool::Select;
-                            data.recognition = Some(recognition);
+                        data.recognition_origin = work.origin;
+                        data.recognition = Some(recognition);
+                        data.text_selection = TextSelection::default();
+                        if data.screen.is_none() {
+                            toolbar::sync_pin(hwnd);
                         }
                     }
                 }
-                Err(e) => alert(hwnd, &e),
+                Err(e) if work.translate => alert(hwnd, &e),
+                Err(e) => data.recognition_error = Some(e),
+            }
+            InvalidateRect(hwnd, null(), 0);
+            if !data.toolbar_window.is_null() {
+                InvalidateRect(data.toolbar_window, null(), 0);
             }
             return 0;
         }
         WM_TIMER if w == 2 => {
+            if data.working
+                || data.recognition_pending
+                || data.selecting_text
+                || !data.text_selection.text.is_empty()
+                || data.text_editor.is_some()
+            {
+                return 0;
+            }
+            clear_recognition(data);
             if let Some(animation) = &mut data.animation {
                 if let Some(Ok(frame)) = animation.frames.next() {
                     let (n, d) = frame.delay().numer_denom_ms();
@@ -2673,62 +3229,65 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_TIMER if w == 3 => {
-            let mut own = RECT::default();
-            GetWindowRect(hwnd, &mut own);
-            let mut intersection = RECT::default();
-            let hidden = data
-                .long
-                .as_ref()
-                .is_some_and(|long| IntersectRect(&mut intersection, &own, &long.region) != 0);
-            if hidden {
-                ShowWindow(hwnd, SW_HIDE);
-                windows_sys::Win32::Graphics::Dwm::DwmFlush();
-            }
-            let next = data
-                .long
-                .as_ref()
-                .and_then(|long| screenshot(long.region).ok());
-            if hidden {
-                ShowWindow(hwnd, SW_SHOWNA);
-            }
-            if let Some(long) = &mut data.long
-                && let Some(next) = next
-                && let Some(shift) = vertical_shift(&long.previous, &next)
-            {
-                if shift > 0
-                    && data.image.height().saturating_add(shift) as u64 * data.image.width() as u64
-                        <= 100_000_000
-                {
-                    let extra = image::imageops::crop_imm(
-                        &next,
-                        0,
-                        next.height() - shift,
-                        next.width(),
-                        shift,
-                    )
-                    .to_image();
-                    let mut combined =
-                        RgbaImage::new(data.image.width(), data.image.height() + shift);
-                    image::imageops::overlay(&mut combined, &data.image, 0, 0);
-                    image::imageops::overlay(&mut combined, &extra, 0, data.image.height() as i64);
-                    data.image = combined;
-                }
-                long.previous = next;
-            }
-            InvalidateRect(hwnd, null(), 0);
+            sample_long(hwnd);
             return 0;
         }
+        WM_TIMER if w == 6 => {
+            if data.text_selection_enabled
+                && !data.recognition_pending
+                && !data.recognition_attempted
+                && !data.dragging
+                && !data.polyline_active
+                && data.text_editor.is_none()
+                && data.long.is_none()
+                && data.list.is_null()
+                && (data.screen.is_none()
+                    || data.selection.right > data.selection.left
+                        && data.selection.bottom > data.selection.top)
+                && let Err(e) = run_ocr(hwnd, data, false)
+            {
+                data.recognition_attempted = true;
+                data.recognition_error = Some(e);
+            }
+            return 0;
+        }
+        WM_COMMIT_TEXT => {
+            if l == 0
+                || data
+                    .text_editor
+                    .as_ref()
+                    .is_some_and(|e| e.hwnd == l as HWND)
+            {
+                text_editor::finish(hwnd, data, w != 0);
+            }
+            return 0;
+        }
+        WM_COMMAND if w & 0xffff == 230 && (w >> 16) as u32 == EN_CHANGE => {
+            text_editor::resize(hwnd, data);
+            return 0;
+        }
+        WM_CTLCOLOREDIT => return text_editor::colors(w as HDC, data),
         WM_MEASUREITEM => {
+            if toolbar::measure_menu(&mut *(l as *mut MEASUREITEMSTRUCT)) {
+                return 1;
+            }
             (*(l as *mut MEASUREITEMSTRUCT)).itemHeight = 118;
             return 1;
         }
         WM_DRAWITEM => {
             let item = &*(l as *const DRAWITEMSTRUCT);
+            if toolbar::draw_menu(data, item) {
+                return 1;
+            }
             if let Some(history) = data.history.get(item.itemID as usize) {
                 FillRect(
                     item.hDC,
                     &item.rcItem,
-                    GetStockObject(WHITE_BRUSH) as HBRUSH,
+                    if item.itemState & ODS_SELECTED != 0 {
+                        theme::selection_brush()
+                    } else {
+                        theme::background_brush()
+                    },
                 );
                 if let Ok(store) =
                     History::new(&(*data.app).root, (*data.app).settings.history_days)
@@ -2748,7 +3307,11 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
                 let mut r = item.rcItem;
                 r.left += 184;
-                SelectObject(item.hDC, data.font);
+                SelectObject(item.hDC, SendMessageW(data.list, WM_GETFONT, 0, 0) as HFONT);
+                SetBkMode(item.hDC, TRANSPARENT as i32);
+                SetTextColor(item.hDC, theme::TEXT);
+                r.top += 20;
+                r.right -= 16;
                 DrawTextW(
                     item.hDC,
                     wide(&format!(
@@ -2764,49 +3327,38 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                     DT_LEFT,
                 );
                 if item.itemState & ODS_SELECTED != 0 {
-                    FrameRect(
+                    FrameRect(item.hDC, &item.rcItem, theme::surface_brush());
+                    theme::fill(
                         item.hDC,
-                        &item.rcItem,
-                        GetStockObject(BLACK_BRUSH) as HBRUSH,
+                        &RECT {
+                            right: item.rcItem.left + 3,
+                            ..item.rcItem
+                        },
+                        theme::ACCENT,
                     );
                 }
             }
             return 1;
         }
-        WM_COMMAND if (201..=203).contains(&(w & 0xffff)) => {
-            let result = (|| -> Result<bool> {
-                match w & 0xffff {
-                    203 => {
-                        if let Some(path) = save_dialog(hwnd) {
-                            save_image(&path, &data.image)?;
-                            store(&*data.app, &data.image, "长截图")?;
-                            Ok(true)
-                        } else {
-                            Ok(false)
-                        }
-                    }
-                    202 => {
-                        store(&*data.app, &data.image, "长截图")?;
-                        pin(&mut *data.app, data.image.clone(), None, false)?;
-                        Ok(true)
-                    }
-                    _ => {
-                        copy_image(hwnd, &data.image)?;
-                        store(&*data.app, &data.image, "长截图")?;
-                        Ok(true)
-                    }
-                }
-            })();
-            match result {
-                Ok(true) => {
-                    KillTimer(hwnd, 3);
-                    DestroyWindow(hwnd);
-                }
-                Ok(false) => {}
-                Err(e) => alert(hwnd, &e),
+        WM_COMMAND if (201..=205).contains(&(w & 0xffff)) => {
+            if data.long.is_some()
+                && let Err(e) = finish_long(hwnd, w & 0xffff)
+            {
+                alert(hwnd, &e);
             }
             return 0;
         }
+        WM_HOTKEY if data.long.is_some() => {
+            if let Some(&(_, _, _, id)) =
+                LONG_HOTKEYS.iter().find(|&&(key, _, _, _)| key == w as i32)
+                && let Err(e) = finish_long(hwnd, id)
+            {
+                alert(hwnd, &e);
+            }
+            return 0;
+        }
+        WM_NCHITTEST if data.long.is_some() => return HTTRANSPARENT as isize,
+        WM_MOUSEACTIVATE if data.long.is_some() => return MA_NOACTIVATE as isize,
         WM_COMMAND if (w >> 16) as u32 == LBN_DBLCLK => {
             let index = SendMessageW(data.list, LB_GETCURSEL, 0, 0);
             if let Some(item) = data.history.get(index as usize) {
@@ -2824,6 +3376,13 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_NCDESTROY => {
+            text_editor::finish(hwnd, data, false);
+            if let Some(long) = &data.long {
+                KillTimer(hwnd, 3);
+                for &id in &long.hotkeys {
+                    UnregisterHotKey(hwnd, id);
+                }
+            }
             let state = &mut *data.app;
             let owned = data.owned;
             state.windows.remove(&(hwnd as usize));
@@ -3015,7 +3574,6 @@ mod tests {
             Tool::Highlight,
             Tool::Text,
             Tool::Number,
-            Tool::Mosaic,
         ] {
             data.marks = vec![Mark {
                 tool,
@@ -3074,8 +3632,61 @@ mod tests {
         assert_eq!(selection_hit(data.selection, [299, 199], 1), 1 | 4);
     }
     #[test]
+    fn mosaic_brush_follows_the_path_and_supports_dabs_crop_and_undo() {
+        let mut data = empty_view(RgbaImage::from_fn(180, 140, |x, y| {
+            Rgba([(x * 17) as u8, (y * 19) as u8, (x * y) as u8, 255])
+        }));
+        data.screen = Some(RECT {
+            left: 0,
+            top: 0,
+            right: 180,
+            bottom: 140,
+        });
+        data.selection = RECT {
+            left: 20,
+            top: 20,
+            right: 160,
+            bottom: 120,
+        };
+        let original = unsafe { render_image(&data, false) }.unwrap();
+        data.marks.push(Mark {
+            tool: Tool::Pen,
+            points: vec![[30, 30], [130, 30], [130, 100]],
+            text: String::new(),
+            color: toolbar::MOSAIC_COLOR,
+            width: 3,
+        });
+        let image = unsafe { render_image(&data, false) }.unwrap();
+        assert_ne!(*image.get_pixel(40, 10), *original.get_pixel(40, 10));
+        assert_eq!(
+            *image.get_pixel(40, 60),
+            *original.get_pixel(40, 60),
+            "mosaic filled the region between the stroke endpoints"
+        );
+        data.color = toolbar::COLORS[0];
+        data.stroke = 6;
+        assert_eq!(unsafe { render_image(&data, false) }.unwrap(), image);
+        data.redo.push(data.marks.pop().unwrap());
+        assert_eq!(unsafe { render_image(&data, false) }.unwrap(), original);
+        data.marks.push(data.redo.pop().unwrap());
+        assert_eq!(unsafe { render_image(&data, false) }.unwrap(), image);
+        data.marks[0].points = vec![[20, 20], [20, 20]];
+        let dab = unsafe { render_image(&data, false) }.unwrap();
+        assert_ne!(*dab.get_pixel(0, 0), *original.get_pixel(0, 0));
+        assert_eq!(
+            *dab.get_pixel(17, 0),
+            *original.get_pixel(17, 0),
+            "round cap exceeded the brush radius"
+        );
+        assert_eq!(*dab.get_pixel(60, 60), *original.get_pixel(60, 60));
+    }
+    #[test]
     fn native_events_finish_drag_undo_polyline_and_keep_pin_border_out_of_export() {
         unsafe {
+            // Isolate this thread's key state from modifiers held on the real desktop.
+            let mut keyboard = [0u8; 256];
+            GetKeyboardState(keyboard.as_mut_ptr());
+            SetKeyboardState([0u8; 256].as_ptr());
             let mut state = App {
                 hwnd: null_mut(),
                 root: PathBuf::new(),
@@ -3130,7 +3741,7 @@ mod tests {
                 crop(&data.image, data.selection).unwrap().dimensions(),
                 (700, 350)
             );
-            for id in [1, 2, 3, 4, 5, 7, 8, 17] {
+            for id in [1, 2, 3, 4, 5, 7, 38, 17] {
                 SendMessageW(hwnd, WM_COMMAND, id, 0);
                 let count = data.marks.len();
                 SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(200, 200));
@@ -3169,6 +3780,27 @@ mod tests {
                 data.marks.last().unwrap().points,
                 vec![[200, 200], [300, 250], [400, 200]]
             );
+            // Choosing the mosaic swatch changes tools and commits the polyline preview.
+            SendMessageW(hwnd, WM_COMMAND, 18, 0);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(450, 220));
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(520, 280));
+            SendMessageW(hwnd, WM_COMMAND, 38, 0);
+            assert!(!data.polyline_active);
+            assert_eq!(
+                data.marks.last().unwrap().points,
+                vec![[450, 220], [520, 280]]
+            );
+            let count = data.marks.len();
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(580, 200));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, at(610, 260));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, at(650, 220));
+            assert_eq!(data.marks.len(), count + 1);
+            assert_eq!(data.marks.last().unwrap().tool, Tool::Pen);
+            assert_eq!(data.marks.last().unwrap().color, toolbar::MOSAIC_COLOR);
+            assert_eq!(
+                data.marks.last().unwrap().points,
+                vec![[580, 200], [610, 260], [650, 220]]
+            );
             SendMessageW(hwnd, WM_LBUTTONDBLCLK, 1, at(400, 200));
             assert_ne!(IsWindow(hwnd), 0, "annotation double click closed the view");
             let evidence = std::env::var_os("PTOOLS_CAPTURE_EVIDENCE").map(PathBuf::from);
@@ -3184,11 +3816,185 @@ mod tests {
                     .save(root.join("annotations-output.png"))
                     .unwrap();
             }
+            // OCR completes in the current screenshot without exporting or replacing it.
+            let marks = data.marks.len();
+            data.tool = Tool::Rect;
+            data.working = true;
+            data.recognition_pending = true;
+            let recognition = Recognition {
+                text: "截图 Hello".into(),
+                words: vec![
+                    crate::ocr::Word {
+                        text: "截图".into(),
+                        bounds: [40.0, 40.0, 40.0, 20.0],
+                    },
+                    crate::ocr::Word {
+                        text: "Hello".into(),
+                        bounds: [100.0, 40.0, 50.0, 20.0],
+                    },
+                ],
+                language: "zh-Hans-CN".into(),
+            };
+            let payload = OcrWork {
+                window: hwnd as usize,
+                token: data.token,
+                generation: data.recognition_generation,
+                origin: [100, 100],
+                translate: false,
+                result: Ok((recognition, None)),
+            };
+            SendMessageW(
+                hwnd,
+                WM_OCR,
+                data.token,
+                Box::into_raw(Box::new(payload)) as isize,
+            );
+            assert_ne!(IsWindow(hwnd), 0);
+            assert!(!data.working);
+            assert!(data.text_selection.text.is_empty());
+            assert_eq!(data.marks.len(), marks);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(141, 141));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, at(179, 159));
+            assert_eq!(data.text_selection.text, "截图");
+            assert_eq!(
+                data.selection.left, 100,
+                "text drag moved the screenshot region"
+            );
+            assert_eq!(data.marks.len(), marks, "text drag created an annotation");
+            assert!(toolbar::enabled(&data, 25));
+            // Cancel capture without touching the user's clipboard in a unit test.
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_CAPTURECHANGED, 0, 0);
+            assert!(!data.dragging);
+            // The OCR switch coexists with the active rectangle tool.
+            SendMessageW(hwnd, WM_COMMAND, 12, 0);
+            assert!(!data.text_selection_enabled);
+            assert_eq!(data.tool, Tool::Rect);
+            assert!(data.text_selection.text.is_empty());
+            SendMessageW(hwnd, WM_COMMAND, 12, 0);
+            assert!(data.text_selection_enabled);
+            assert_eq!(data.tool, Tool::Rect);
+            assert!(text_hit(hwnd, &data, [141, 141]));
+            data.start = [141, 141];
+            select_text(hwnd, &mut data, [179, 159]);
+            if let Some(root) = &evidence {
+                let mut frame = RgbaImage::new(1000, 700);
+                paint_native(&mut frame, |dc| {
+                    SendMessageW(hwnd, WM_PRINTCLIENT, dc as usize, 0);
+                });
+                frame.save(root.join("capture-text-selection.png")).unwrap();
+            }
+            SendMessageW(hwnd, WM_COMMAND, 0, 0);
+            assert!(!contains(toolbar::layout(hwnd, &data).bounds, [120, 120]));
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(120, 120));
+            assert!(
+                data.text_selection.text.is_empty(),
+                "blank drag kept the previous text selection"
+            );
+            assert!(!toolbar::enabled(&data, 25));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, at(150, 140));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, at(150, 140));
+            assert_eq!(data.selection.left, 130);
+            assert_eq!(data.selection.top, 120);
+            SendMessageW(hwnd, WM_COMMAND, 1, 0);
+            SendMessageW(hwnd, WM_COMMAND, 21, 0);
+            assert_eq!(
+                data.tool,
+                Tool::Rect,
+                "undo changed the drawing tool while OCR was enabled"
+            );
+            assert!(data.text_selection_enabled);
+            assert!(data.recognition.is_none() && data.text_selection.text.is_empty());
+            // A result from an older crop must not restore obsolete word coordinates.
+            let obsolete = OcrWork {
+                window: hwnd as usize,
+                token: data.token,
+                generation: data.recognition_generation.wrapping_sub(1),
+                origin: [100, 100],
+                translate: false,
+                result: Ok((
+                    Recognition {
+                        text: "旧结果".into(),
+                        words: vec![],
+                        language: "zh-Hans-CN".into(),
+                    },
+                    None,
+                )),
+            };
+            SendMessageW(
+                hwnd,
+                WM_OCR,
+                data.token,
+                Box::into_raw(Box::new(obsolete)) as isize,
+            );
+            assert!(data.recognition.is_none());
+            SendMessageW(hwnd, WM_COMMAND, 22, 0);
+            assert!(data.recognition.is_none());
             state.settings.shadow = true;
             assert_eq!(render_image(&data, false).unwrap().dimensions(), (700, 350));
             assert_eq!(rendered(&data).unwrap().dimensions(), (724, 374));
+            // Text is edited by a child control on this image, with no modal form.
+            SendMessageW(hwnd, WM_COMMAND, 6, 0);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(240, 270));
+            let edit = GetDlgItem(hwnd, 230);
+            assert!(!edit.is_null());
+            assert_eq!(GetParent(edit), hwnd);
+            SetWindowTextW(edit, wide("图内文字 & ptools\r\n第二行").as_ptr());
+            let mut editor_rect = RECT::default();
+            GetClientRect(edit, &mut editor_rect);
+            assert!(
+                editor_rect.bottom >= 48,
+                "multiline inline preview clipped its second line"
+            );
+            let count = data.marks.len();
+            SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+            assert!(data.text_editor.is_none());
+            assert_eq!(data.marks.len(), count + 1);
+            let mark = data.marks.last().unwrap();
+            assert_eq!(mark.points[0], [240, 270]);
+            assert_eq!(mark.text, "图内文字 & ptools\r\n第二行");
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(400, 300));
+            let edit = GetDlgItem(hwnd, 230);
+            SetWindowTextW(edit, wide("取消").as_ptr());
+            SendMessageW(edit, EM_SETSEL, 2, 2);
+            let mut shift = [0u8; 256];
+            shift[VK_SHIFT as usize] = 0x80;
+            SetKeyboardState(shift.as_ptr());
+            SendMessageW(edit, WM_KEYDOWN, VK_RETURN as usize, 0);
+            // A fast chord can queue Shift-up before the translated character.
+            SetKeyboardState([0u8; 256].as_ptr());
+            SendMessageW(edit, WM_CHAR, VK_RETURN as usize, 0);
+            assert!(
+                data.text_editor.is_some(),
+                "Shift+Enter committed the annotation"
+            );
+            let mut text = [0u16; 32];
+            let len = GetWindowTextW(edit, text.as_mut_ptr(), text.len() as i32);
+            assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "取消\r\n");
+            SendMessageW(edit, WM_KEYDOWN, VK_ESCAPE as usize, 0);
+            assert!(data.text_editor.is_none());
+            assert_eq!(data.marks.len(), count + 1);
+            assert_ne!(IsWindow(hwnd), 0);
             // A pinned view has a display-only frame and a separate toolbar.
             data.screen = None;
+            data.recognition = Some(Recognition {
+                text: "截图".into(),
+                words: vec![crate::ocr::Word {
+                    text: "截图".into(),
+                    bounds: [40.0, 40.0, 40.0, 20.0],
+                }],
+                language: "zh-Hans-CN".into(),
+            });
+            data.recognition_origin = [0, 0];
+            data.start = [142, 142];
+            select_text(hwnd, &mut data, [180, 160]);
+            assert!(
+                data.text_selection.text.is_empty(),
+                "pin retained the screenshot crop origin"
+            );
+            data.start = [42, 42];
+            select_text(hwnd, &mut data, [80, 60]);
+            assert_eq!(data.text_selection.text, "截图");
             data.marks.clear();
             data.tool = Tool::Select;
             assert_eq!(image_point(hwnd, &data, [2, 2]), [0, 0]);
@@ -3207,6 +4013,16 @@ mod tests {
             data.editing = true;
             toolbar::sync_pin(hwnd);
             assert!(!data.toolbar_window.is_null());
+            SendMessageW(hwnd, WM_COMMAND, 2, 0);
+            assert_eq!(data.group_tools[0], 2);
+            SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE as usize, 0);
+            assert!(!data.editing);
+            assert_eq!(data.tool, Tool::Select);
+            SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE as usize, 0);
+            assert!(data.editing);
+            assert_eq!(data.tool, Tool::Ellipse);
+            assert_eq!(data.group_tools[0], 2);
+            assert!(data.text_selection_enabled);
             if let Some(root) = &evidence {
                 let layout = toolbar::layout(data.toolbar_window, &data);
                 let mut frame =
@@ -3226,6 +4042,7 @@ mod tests {
                 0,
                 "floating toolbar leaked after closing pin"
             );
+            SetKeyboardState(keyboard.as_ptr());
         }
     }
     #[test]
@@ -3292,5 +4109,104 @@ mod tests {
             ),
             None
         );
+    }
+    #[test]
+    fn long_capture_appends_original_pixels_and_keeps_a_fixed_region() {
+        let full = RgbaImage::from_fn(180, 480, |x, y| {
+            Rgba([
+                (x * y % 251) as u8,
+                (y * 13 % 253) as u8,
+                (x + y * 7) as u8,
+                255,
+            ])
+        });
+        let first = image::imageops::crop_imm(&full, 0, 0, 180, 240).to_image();
+        let mut long = LongCapture {
+            region: RECT {
+                left: -600,
+                top: 200,
+                right: -420,
+                bottom: 440,
+            },
+            previous: first.clone(),
+            image: first.clone(),
+            paused: false,
+            status: String::new(),
+            hotkeys: vec![],
+        };
+        append_long_frame(
+            &mut long,
+            image::imageops::crop_imm(&full, 0, 80, 180, 240).to_image(),
+        );
+        assert_eq!(
+            long.image,
+            image::imageops::crop_imm(&full, 0, 0, 180, 320).to_image()
+        );
+        assert_eq!(
+            [
+                long.region.left,
+                long.region.top,
+                long.region.right,
+                long.region.bottom
+            ],
+            [-600, 200, -420, 440]
+        );
+        long.paused = true;
+        let before = long.image.clone();
+        append_long_frame(
+            &mut long,
+            image::imageops::crop_imm(&full, 0, 160, 180, 240).to_image(),
+        );
+        assert_eq!(long.image, before);
+        long.paused = false;
+        append_long_frame(
+            &mut long,
+            RgbaImage::from_pixel(180, 240, Rgba([255, 255, 255, 255])),
+        );
+        assert_eq!(long.image, before);
+        append_long_frame(
+            &mut long,
+            image::imageops::crop_imm(&full, 0, 160, 180, 240).to_image(),
+        );
+        assert_eq!(
+            long.image,
+            image::imageops::crop_imm(&full, 0, 0, 180, 400).to_image()
+        );
+    }
+    #[test]
+    fn long_capture_frame_only_paints_outside_the_capture_rectangle() {
+        let mut image = RgbaImage::new(180, 140);
+        let selection = RECT {
+            left: 30,
+            top: 25,
+            right: 150,
+            bottom: 115,
+        };
+        unsafe {
+            paint_native(&mut image, |dc| {
+                draw_long_frame(
+                    dc,
+                    RECT {
+                        left: 0,
+                        top: 0,
+                        right: 180,
+                        bottom: 140,
+                    },
+                    selection,
+                )
+            });
+        }
+        for y in 25..115 {
+            for x in 30..150 {
+                assert_eq!(
+                    &image.get_pixel(x, y).0[..3],
+                    &[0, 0, 0],
+                    "frame leaked into the captured image"
+                );
+            }
+        }
+        for (x, y) in [(29, 25), (30, 24), (150, 25), (30, 115)] {
+            assert_ne!(&image.get_pixel(x, y).0[..3], &[0, 0, 0]);
+        }
     }
 }

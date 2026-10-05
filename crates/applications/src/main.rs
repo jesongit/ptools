@@ -187,6 +187,12 @@ fn run() -> Result<(), String> {
         return Err("Unsupported request".into());
     }
     let mut entries = BTreeMap::new();
+    // Built-in names and aliases take precedence over shortcuts with the same title.
+    for command in ptools_core::SYSTEM_COMMANDS {
+        if command.available() {
+            entries.insert(command.title.to_lowercase(), command.entry());
+        }
+    }
     let mut warnings = Vec::new();
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok() };
     let mut roots = Vec::new();

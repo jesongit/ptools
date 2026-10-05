@@ -2,7 +2,7 @@
   "schema_version": 2,
   "id": "capture",
   "name": "截图与贴图",
-  "version": "0.1.0",
+  "version": "0.1.5",
   "description": "按需启动的原生截图、标注、贴图、离线识别、取色和二维码工具。图片历史默认保留7天。",
   "runtime": "interactive",
   "executable": "ptools-capture.exe",

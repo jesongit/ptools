@@ -6,7 +6,7 @@ $PackageRoot=(Resolve-Path -LiteralPath $PackageRoot).Path
 $runRoot=Join-Path $projectRoot ('artifacts/tools-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
 $dataRoot=Join-Path $runRoot 'data'
 New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
-$results=[ordered]@{timestamp=(Get-Date).ToString('o');checks=@();keyboard_mode='WM_HOTKEY dispatch';network_translation='not tested; no credentials';real_uninstall='not performed'}
+$results=[ordered]@{timestamp=(Get-Date).ToString('o');checks=@();keyboard_mode='WM_HOTKEY dispatch';network_translation='not tested; no credentials'}
 function Check([bool]$Ok,[string]$Name) {
     $script:results.checks+=@{name=$Name;passed=$Ok}
     if(-not $Ok) { throw "FAILED: $Name" }; Write-Output "PASS: $Name"
@@ -79,7 +79,6 @@ function Send-Invocation([Diagnostics.Process]$Process,[string]$Action,[string]$
     $Process.StandardInput.WriteLine($json); $Process.StandardInput.Flush()
 }
 $capture=Join-Path $PackageRoot 'plugins/capture/ptools-capture.exe'
-$uninstaller=Join-Path $PackageRoot 'plugins/uninstaller/ptools-uninstaller.exe'
 $hostExe=Join-Path $PackageRoot 'ptools.exe'
 $owned=[Collections.Generic.List[Diagnostics.Process]]::new()
 $foreground=[ToolsWin]::GetForegroundWindow()
@@ -87,9 +86,6 @@ try {
     $probe=Invoke-Tool $capture @('--probe-ocr') | ConvertFrom-Json
     Check ($probe.recognition.text -match 'Hello' -and $probe.recognition.text -match '12345' -and $probe.recognition.words.Count -gt 0) 'Offline OCR recognizes rendered Chinese/English/numbers and word positions'
     $results.ocr=$probe
-    $software=Invoke-Tool $uninstaller @('--list') | ConvertFrom-Json
-    Check ($software.Count -gt 0) 'Desktop uninstall registry enumeration'
-    $results.desktop_software_count=$software.Count
     # Create only a private history fixture; no clipboard or real application changes.
     $captureRoot=Join-Path $dataRoot 'plugin-data/capture'
     $images=Join-Path $captureRoot 'images'; New-Item -ItemType Directory -Path $images -Force | Out-Null
@@ -108,7 +104,7 @@ try {
     Wait-For { $script:hostWindow=@([ToolsWin]::Windows($gui.Id,'', $false) | Where-Object { [ToolsWin]::GetDlgItem($_,201) -ne [IntPtr]::Zero })[0]; $hostWindow -ne $null }
     Wait-For { Test-Path -LiteralPath (Join-Path $dataRoot 'index.json') }
     Start-Sleep -Milliseconds 400
-    Check (@(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($gui.Id) AND (Name='ptools-capture.exe' OR Name='ptools-uninstaller.exe')").Count -eq 0) 'Interactive tools never run during host indexing'
+    Check (@(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($gui.Id) AND Name='ptools-capture.exe'").Count -eq 0) 'Capture never runs during host indexing'
     $results.host_before_tools=Memory $gui
     $watch=[Diagnostics.Stopwatch]::StartNew()
     [void][ToolsWin]::PostMessage($hostWindow,0x0312,[IntPtr]1000,[IntPtr]::Zero)
@@ -146,24 +142,18 @@ try {
     Wait-For { $script:form=@([ToolsWin]::Windows($tool.Id,'ptools.tool.form',$true))[0]; $form -ne $null }
     Snapshot $form 'capture-settings.png'
     Check ([ToolsWin]::GetDlgItem($form,10) -ne [IntPtr]::Zero) 'Native settings fields render'
+    $toggle=[ToolsWin]::GetDlgItem($form,11)
+    $before=[ToolsWin]::Send($toggle,0x00F0,[IntPtr]::Zero,[IntPtr]::Zero).ToInt64()
+    [void][ToolsWin]::Send($toggle,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero)
+    Check ([ToolsWin]::Send($toggle,0x00F0,[IntPtr]::Zero,[IntPtr]::Zero).ToInt64() -ne $before) 'Themed checkbox preserves native click behavior'
+    [void][ToolsWin]::Send($toggle,0x00F5,[IntPtr]::Zero,[IntPtr]::Zero)
     [void][ToolsWin]::PostMessage($form,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
     Check ($tool.WaitForExit(5000)) 'Cancel settings releases the tool process'
-    $tool=Start-Tool $uninstaller @('--interactive') -Interactive; $owned.Add($tool)
-    Send-Invocation $tool 'open' (Join-Path $dataRoot 'plugin-data/uninstaller')
-    Wait-For { $script:uninstallWindow=@([ToolsWin]::Windows($tool.Id,'ptools.uninstaller',$true))[0]; $uninstallWindow -ne $null }
-    $list=[ToolsWin]::GetDlgItem($uninstallWindow,2)
-    Check ([ToolsWin]::Send($list,0x1004,[IntPtr]::Zero,[IntPtr]::Zero).ToInt64() -gt 0) 'Desktop software list renders'
-    Snapshot $uninstallWindow 'uninstaller.png'
-    $results.uninstaller_active=Memory $tool
-    [void][ToolsWin]::SendMessage([ToolsWin]::GetDlgItem($uninstallWindow,1),0x000C,[IntPtr]::Zero,'zz_ptools_no_such_software')
-    Check ([ToolsWin]::Send($list,0x1004,[IntPtr]::Zero,[IntPtr]::Zero).ToInt64() -eq 0) 'Software filtering responds without filesystem scanning'
-    [void][ToolsWin]::PostMessage($uninstallWindow,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
-    Check ($tool.WaitForExit(5000)) 'Uninstaller closes without a resident process'
     $results.host_after_tools=Memory $gui
     $gui.Refresh(); $cpu=$gui.TotalProcessorTime.TotalMilliseconds
     Start-Sleep -Seconds 2; $gui.Refresh()
     $results.host_idle_cpu_ms=$gui.TotalProcessorTime.TotalMilliseconds-$cpu
-    $results.file_sizes=@(Get-Item -LiteralPath $hostExe,$capture,$uninstaller | ForEach-Object { @{name=$_.Name;bytes=$_.Length} })
+    $results.file_sizes=@(Get-Item -LiteralPath $hostExe,$capture | ForEach-Object { @{name=$_.Name;bytes=$_.Length} })
     # Reopen a capture, terminate only our test host, and confirm Job Object cleanup.
     [void][ToolsWin]::PostMessage($hostWindow,0x0312,[IntPtr]1000,[IntPtr]::Zero)
     Wait-For { $script:record=Get-CimInstance Win32_Process -Filter "ParentProcessId=$($gui.Id) AND Name='ptools-capture.exe'"; $null -ne $record }

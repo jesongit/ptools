@@ -1,7 +1,9 @@
 use image::RgbaImage;
+use ptools_ui as theme;
 use std::{
     mem::{size_of, zeroed},
     ptr::{null, null_mut},
+    time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
@@ -58,7 +60,14 @@ pub unsafe fn child(
         0,
         wide(class).as_ptr(),
         wide(title).as_ptr(),
-        WS_CHILD | WS_VISIBLE | style,
+        WS_CHILD
+            | WS_VISIBLE
+            | style
+            | if matches!(class, "BUTTON" | "EDIT" | "LISTBOX" | "SysListView32") {
+                WS_TABSTOP
+            } else {
+                0
+            },
         rect[0],
         rect[1],
         rect[2],
@@ -88,8 +97,29 @@ pub unsafe fn child(
         ) as usize
     });
     SendMessageW(hwnd, WM_SETFONT, font, 1);
+    theme::window(parent);
+    theme::control(hwnd);
+    if class == "BUTTON" && style & 0xf == BS_DEFPUSHBUTTON as u32 {
+        theme::button(hwnd, theme::PRIMARY_BUTTON);
+    }
     hwnd
 }
+// Clipboard listeners and input methods can briefly hold the clipboard after
+// a selection. Give them time to release it without blocking the UI for long.
+unsafe fn open_clipboard(hwnd: HWND) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        if OpenClipboard(hwnd) != 0 {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
 /// # Safety
 /// `hwnd` must be null or a live window on the calling thread.
 pub unsafe fn copy_text(hwnd: HWND, text: &str) -> Result<(), String> {
@@ -105,7 +135,7 @@ pub unsafe fn copy_text(hwnd: HWND, text: &str) -> Result<(), String> {
     }
     std::ptr::copy_nonoverlapping(value.as_ptr(), p.cast(), value.len());
     GlobalUnlock(memory);
-    if OpenClipboard(hwnd) == 0 {
+    if !open_clipboard(hwnd) {
         GlobalFree(memory);
         return Err("剪贴板正被其他程序占用，请重试".into());
     }
@@ -122,7 +152,7 @@ pub unsafe fn copy_text(hwnd: HWND, text: &str) -> Result<(), String> {
 /// # Safety
 /// `hwnd` must be null or a live window on the calling thread.
 pub unsafe fn clipboard_text(hwnd: HWND) -> Option<String> {
-    if OpenClipboard(hwnd) == 0 {
+    if !open_clipboard(hwnd) {
         return None;
     }
     let handle = GetClipboardData(13);
@@ -239,7 +269,7 @@ pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
         pixel.swap(0, 2);
     }
     GlobalUnlock(memory);
-    if OpenClipboard(hwnd) == 0 {
+    if !open_clipboard(hwnd) {
         GlobalFree(memory);
         return Err("剪贴板正被其他程序占用，请重试".into());
     }
@@ -495,7 +525,7 @@ pub unsafe fn form(parent: HWND, title: &str, note: &str, fields: &[Field]) -> O
         hInstance: module,
         lpszClassName: class.as_ptr(),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        hbrBackground: theme::background_brush(),
         ..zeroed()
     });
     let mut state = Form {
@@ -647,7 +677,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str, multiline: bool) 
         hInstance: module,
         lpszClassName: class.as_ptr(),
         hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-        hbrBackground: (COLOR_WINDOW + 1) as HBRUSH,
+        hbrBackground: theme::background_brush(),
         ..zeroed()
     };
     RegisterClassW(&wc);
@@ -732,6 +762,61 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str, multiline: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_retry_times_out_on_contention_and_acquires_after_release() {
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || unsafe {
+            // Separate window association matters: OpenClipboard(NULL) can
+            // reuse this process's already-open clipboard across threads.
+            let window = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                wide("").as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!window.is_null());
+            let opened = open_clipboard(window);
+            ready_tx.send(opened).unwrap();
+            if opened {
+                let _ = release_rx.recv();
+                std::thread::sleep(Duration::from_millis(30));
+                assert_ne!(CloseClipboard(), 0);
+            }
+            DestroyWindow(window);
+        });
+        assert!(ready_rx.recv().unwrap());
+        let start = Instant::now();
+        let blocked = unsafe { open_clipboard(null_mut()) };
+        let waited = start.elapsed();
+        if blocked {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+        release_tx.send(()).unwrap();
+        let acquired = unsafe { open_clipboard(null_mut()) };
+        if acquired {
+            unsafe {
+                CloseClipboard();
+            }
+        }
+        holder.join().unwrap();
+        assert!(!blocked, "another thread still has the clipboard open");
+        assert!(waited >= Duration::from_millis(150));
+        assert!(acquired, "clipboard should become available after release");
+        // Opening and closing alone preserves the user's clipboard contents.
+    }
+
     #[test]
     fn png_preserves_alpha_and_jpeg_flattens_transparency() {
         let root = std::env::temp_dir().join(format!(

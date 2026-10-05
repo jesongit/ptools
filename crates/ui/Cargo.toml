@@ -1,0 +1,8 @@
+[package]
+name = "ptools-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse"] }
