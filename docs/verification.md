@@ -1,5 +1,19 @@
 # ptools 验证记录
 
+## 2026-10-07：QQ 图片粘贴兼容性
+
+截图插件 0.1.6 的图片复制同时写入注册的 PNG 格式与正高度的 CF_DIBV5，PNG 优先，位图像素行从下向上存储。普通截图、快速截图、长截图、贴图和历史共用该复制函数。两种格式在清空剪贴板前完成编码和内存分配；发布成功后将内存所有权交给 Windows，失败时释放未交接的内存。
+
+原因核对：[Windows 位图规范](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv5header) 允许负高度位图；本机 QQ 9.9.36-53644 加载的 QQNT.dll 包含 Electron 40.0.0 / Chromium 144.0.7559.60。[对应 Chromium 源码](https://chromium.googlesource.com/chromium/src/+/refs/tags/144.0.7559.60/ui/base/clipboard/clipboard_win.cc#949) 在位图读取时直接将有符号高度参与无符号图片大小检查，会拒绝负高度；它自己的图片写入同时提供 PNG 和位图。旧插件实际写入的 128×64 测试图在 CF_DIBV5 和 Windows 转换的 CF_DIB 中高度都为 -64，没有 PNG。此问题属于剪贴板图片布局的兼容性缺口，QQ 实际聊天输入框未自动验收。
+
+- 工作区 76 项测试通过。新增独立 PNG / BMP 解码验证非对称多行图片的方向、RGB、透明度和尺寸，以及空图片在发布前被拒绝；单元测试不写入用户剪贴板。Clippy（`-D warnings`）通过。
+- 原生剪贴板 40 项检查通过：`artifacts/capture-clipboard-20261007-143922-29d48ab5/results.json`。实际贴图复制提供 PNG、CF_DIBV5 和 Windows 转换的 CF_DIB / CF_BITMAP；PNG 优先，正高度与图片大小正确，独立 PNG / BMP 解码像素正确。覆盖复制后立即、200 / 1000 / 3000 毫秒和进程退出后的读取，剪贴板未被覆盖，原剪贴板和前台窗口已恢复。旧插件在同一验收中因缺少 PNG 失败。
+- 原有截图编辑、文字选择和 OCR 的 44 项原生回归检查通过：`artifacts/capture-editing-20261007-144012-93ddcdb4/results.json`，包括真实截图框选后复制、图内文字提交与撤销。完整包的插件升级、数据保留、单独重装和二进制哈希 12 项检查通过：`artifacts/package-20261007-144022/results.json`。
+
+工具进程与离线 OCR 的 10 项原生检查通过：`artifacts/tools-20261007-144138/results.json`。本机已安装插件再次通过 40 项剪贴板检查：`artifacts/capture-clipboard-20261007-144352-a7193a12/results.json`；安装目录中的二进制与修复包哈希一致（SHA256 `4EEC2D154982761673B1F7A3275E13A5D0274432B3B0B100891823D7535EE6DE`）。旧插件程序已备份，原配置和图片历史保留，宿主已重新启动。部署记录：`artifacts/clipboard-deployment-20261007-144234/results.json`。
+
+修复完整包位于 `dist/qq-clipboard-fix`，宿主版本仍为 0.1.9，截图插件升级到 0.1.6。
+
 ## 2026-10-03：截图与贴图标注工具分组
 
 ptools 0.1.9 / 截图插件 0.1.5 将矩形与椭圆、直线与折线与箭头、画笔与荧光笔分别合并为三组工具。主按钮显示并使用当前窗口为该组记住的成员；右侧小三角展开带图标与文字名称的菜单，菜单和原快捷键都可切换成员。截图和贴图浮动工具栏共用此行为，组内成员切换继续使用原有绘制与撤销逻辑。

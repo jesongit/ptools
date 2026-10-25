@@ -6,7 +6,7 @@ Windows 原生应用启动器与轻量工具。Rust 本体 + 按需运行的 EXE
 
 ## 使用
 
-解压 `ptools-0.1.9-windows-x64.zip`，双击 `ptools.exe` 后直接驻留托盘；按 `Alt + Space` 或点击托盘图标打开搜索框。需要启动时显示搜索框，可使用 `ptools.exe --show`。第一次会安装随包的应用启动、截图与贴图两个插件，并在后台建立索引。更新完整包时，先通过托盘“关闭”退出旧版，再启动新版；启动时会自动升级版本较旧的随包插件，保留配置、历史、使用记录和停用状态。本包随附截图与贴图插件 0.1.5，旧版插件会自动升级。已卸载的随包插件不会重新安装，也不会降级已安装的较新版本。0.1.3 移除了自研软件卸载器，升级会移除以前随包安装的旧卸载插件，保留其插件数据。
+解压 `ptools-0.1.9-windows-x64.zip`，双击 `ptools.exe` 后直接驻留托盘；按 `Alt + Space` 或点击托盘图标打开搜索框。需要启动时显示搜索框，可使用 `ptools.exe --show`。第一次会安装随包的应用启动、截图与贴图两个插件，并在后台建立索引。更新完整包时，先通过托盘“关闭”退出旧版，再启动新版；启动时会自动升级版本较旧的随包插件，保留配置、历史、使用记录和停用状态。本包随附截图与贴图插件 0.1.6，旧版插件会自动升级。已卸载的随包插件不会重新安装，也不会降级已安装的较新版本。0.1.3 移除了自研软件卸载器，升级会移除以前随包安装的旧卸载插件，保留其插件数据。
 
 - `Alt + Space` 显示 / 隐藏搜索框。冲突时可点击托盘图标查看提示，输入“设置”可切换。
 - 唤起时在鼠标所在屏幕的可用区域居中，结果和菜单展开后保持居中，适配不同屏幕缩放。
@@ -86,6 +86,7 @@ pwsh -STA -File ./scripts/verify-system-launcher.ps1
 pwsh -STA -File ./scripts/verify-quick-input.ps1 -VerifyClipboard
 pwsh -STA -File ./scripts/verify-capture-selection.ps1
 pwsh -STA -File ./scripts/verify-capture-editing.ps1
+pwsh -STA -File ./scripts/verify-capture-clipboard.ps1
 pwsh -STA -File ./scripts/verify-capture-groups.ps1
 pwsh -STA -File ./scripts/verify-long-capture.ps1
 ```

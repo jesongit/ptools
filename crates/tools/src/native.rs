@@ -1,4 +1,4 @@
-use image::RgbaImage;
+use image::{ImageEncoder, RgbaImage};
 use ptools_ui as theme;
 use std::{
     mem::{size_of, zeroed},
@@ -228,60 +228,124 @@ unsafe fn draw_scaled(dc: HDC, image: &RgbaImage, rect: [i32; 4], mode: i32) {
         SRCCOPY,
     );
 }
-/// # Safety
-/// `hwnd` must be null or a live window on the calling thread.
-pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
+fn clipboard_image_data(image: &RgbaImage) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let width = i32::try_from(image.width()).map_err(|_| "图片过大，无法复制")?;
+    let height = i32::try_from(image.height()).map_err(|_| "图片过大，无法复制")?;
+    if width == 0 || height == 0 {
+        return Err("图片尺寸无效，无法复制".into());
+    }
+    let image_size = u32::try_from(image.as_raw().len()).map_err(|_| "图片过大，无法复制")?;
+    let mut png = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut png)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgba8,
+        )
+        .map_err(|e| format!("图片编码失败：{e}"))?;
+
+    // Chromium 144 (used by QQ NT) rejects negative DIB heights when checking
+    // the unsigned image size. Use bottom-up rows with a positive height, and
+    // also offer PNG as Chromium does for interoperable transparent images.
     let header = BITMAPV5HEADER {
         bV5Size: size_of::<BITMAPV5HEADER>() as u32,
-        bV5Width: image.width() as i32,
-        bV5Height: -(image.height() as i32),
+        bV5Width: width,
+        bV5Height: height,
         bV5Planes: 1,
         bV5BitCount: 32,
         bV5Compression: BI_BITFIELDS,
+        bV5SizeImage: image_size,
         bV5RedMask: 0x00ff0000,
         bV5GreenMask: 0x0000ff00,
         bV5BlueMask: 0x000000ff,
         bV5AlphaMask: 0xff000000,
         bV5CSType: 0x73524742,
-        ..zeroed()
+        ..unsafe { zeroed() }
     };
-    let memory = GlobalAlloc(
-        GMEM_MOVEABLE,
-        size_of::<BITMAPV5HEADER>() + image.as_raw().len(),
-    );
-    if memory.is_null() {
-        return Err("剪贴板内存分配失败".into());
+    let mut dib = vec![0; size_of::<BITMAPV5HEADER>() + image.as_raw().len()];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (&header as *const BITMAPV5HEADER).cast::<u8>(),
+            dib.as_mut_ptr(),
+            size_of::<BITMAPV5HEADER>(),
+        );
     }
-    let p = GlobalLock(memory).cast::<u8>();
-    if p.is_null() {
-        GlobalFree(memory);
-        return Err("剪贴板内存锁定失败".into());
+    let row_bytes = image.width() as usize * 4;
+    for (source, destination) in image.as_raw().chunks_exact(row_bytes).zip(
+        dib[size_of::<BITMAPV5HEADER>()..]
+            .chunks_exact_mut(row_bytes)
+            .rev(),
+    ) {
+        destination.copy_from_slice(source);
+        for pixel in destination.as_chunks_mut::<4>().0 {
+            pixel.swap(0, 2);
+        }
     }
-    std::ptr::copy_nonoverlapping(
-        (&header as *const BITMAPV5HEADER).cast::<u8>(),
-        p,
-        size_of::<BITMAPV5HEADER>(),
-    );
-    let pixels =
-        std::slice::from_raw_parts_mut(p.add(size_of::<BITMAPV5HEADER>()), image.as_raw().len());
-    pixels.copy_from_slice(image.as_raw());
-    for pixel in pixels.as_chunks_mut::<4>().0 {
-        pixel.swap(0, 2);
+    Ok((png, dib))
+}
+
+// Windows takes ownership only after SetClipboardData succeeds. Retain and
+// free each allocation automatically on all preparation/publication failures.
+struct ClipboardMemory(HGLOBAL);
+
+impl ClipboardMemory {
+    unsafe fn new(bytes: &[u8]) -> Result<Self, String> {
+        let memory = Self(GlobalAlloc(GMEM_MOVEABLE, bytes.len()));
+        if memory.0.is_null() {
+            return Err("剪贴板内存分配失败".into());
+        }
+        let p = GlobalLock(memory.0).cast::<u8>();
+        if p.is_null() {
+            return Err("剪贴板内存锁定失败".into());
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
+        GlobalUnlock(memory.0);
+        Ok(memory)
     }
-    GlobalUnlock(memory);
+
+    unsafe fn publish(mut self, format: u32) -> Result<(), String> {
+        if SetClipboardData(format, self.0).is_null() {
+            return Err("无法复制图片".into());
+        }
+        self.0 = null_mut();
+        Ok(())
+    }
+}
+
+impl Drop for ClipboardMemory {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { GlobalFree(self.0) };
+        }
+    }
+}
+
+/// # Safety
+/// `hwnd` must identify a live window on the calling thread.
+pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
+    let (png_bytes, dib_bytes) = clipboard_image_data(image)?;
+    let png_format = RegisterClipboardFormatW(wide("PNG").as_ptr());
+    if png_format == 0 {
+        return Err("无法注册剪贴板图片格式".into());
+    }
+    // Prepare both representations before replacing the user's clipboard.
+    let png = ClipboardMemory::new(&png_bytes)?;
+    let dib = ClipboardMemory::new(&dib_bytes)?;
     if !open_clipboard(hwnd) {
-        GlobalFree(memory);
         return Err("剪贴板正被其他程序占用，请重试".into());
     }
-    EmptyClipboard();
-    let ok = !SetClipboardData(17, memory).is_null();
-    CloseClipboard();
-    if ok {
+    let result = (|| {
+        if EmptyClipboard() == 0 {
+            return Err("无法清空剪贴板".into());
+        }
+        // PNG first preserves alpha for applications using format order.
+        png.publish(png_format)?;
+        dib.publish(17)?; // CF_DIBV5; Windows synthesizes CF_DIB / CF_BITMAP.
         Ok(())
-    } else {
-        GlobalFree(memory);
-        Err("无法复制图片".into())
-    }
+    })();
+    CloseClipboard();
+    result
 }
 /// # Safety
 /// Call on an initialized desktop UI thread with physical screen coordinates.
@@ -762,6 +826,44 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str, multiline: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_png_and_dib_decode_with_matching_orientation_color_and_alpha() {
+        let image = RgbaImage::from_raw(
+            3,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 17, 33, 65, 255, 20, 40, 60, 64, 255,
+                255, 255, 255,
+            ],
+        )
+        .unwrap();
+        let (png, dib) = clipboard_image_data(&image).unwrap();
+        assert_eq!(image::load_from_memory(&png).unwrap().to_rgba8(), image);
+        // Independent BMP decoding catches row reversal, BGRA conversion and
+        // alpha-mask errors instead of reproducing the clipboard writer.
+        let mut bmp = Vec::new();
+        bmp.extend_from_slice(b"BM");
+        bmp.extend_from_slice(&(14 + dib.len() as u32).to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&(14 + size_of::<BITMAPV5HEADER>() as u32).to_le_bytes());
+        bmp.extend_from_slice(&dib);
+        assert_eq!(
+            image::load_from_memory_with_format(&bmp, image::ImageFormat::Bmp)
+                .unwrap()
+                .to_rgba8(),
+            image
+        );
+        // The positive height is required by QQ's Chromium bitmap fallback.
+        assert_eq!(i32::from_le_bytes(dib[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(dib[20..24].try_into().unwrap()), 24);
+    }
+
+    #[test]
+    fn empty_clipboard_images_are_rejected_before_publication() {
+        assert!(clipboard_image_data(&RgbaImage::new(0, 2)).is_err());
+        assert!(clipboard_image_data(&RgbaImage::new(2, 0)).is_err());
+    }
 
     #[test]
     fn clipboard_retry_times_out_on_contention_and_acquires_after_release() {
