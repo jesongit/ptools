@@ -16,7 +16,8 @@ public static class DailyUpdateWin {
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb,IntPtr l);
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h,out uint pid);
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h,StringBuilder value,int max);
-  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool SetWindowText(IntPtr h,string text);
+  [DllImport("user32.dll",EntryPoint="SendMessageTimeoutW",CharSet=CharSet.Unicode)] static extern IntPtr SendQuery(IntPtr h,uint msg,IntPtr w,string l,uint flags,uint timeout,out UIntPtr result);
+  public static bool SetWindowText(IntPtr h,string text) { return SendQuery(h,0x000C,IntPtr.Zero,text,2,2000,out UIntPtr result)!=IntPtr.Zero; }
   [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder text,int max);
   [DllImport("user32.dll")] public static extern IntPtr GetDlgItem(IntPtr h,int id);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h,uint msg,IntPtr w,IntPtr l);
