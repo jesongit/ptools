@@ -1,4 +1,4 @@
-ptools v0.1.10 - third-party notices
+ptools v0.1.11 - third-party notices
 License texts from the locked Windows x64 GNU dependencies, including build dependencies.
 
 ============================================================

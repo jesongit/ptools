@@ -15,6 +15,7 @@ use std::{
     mem::{size_of, zeroed},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
+    sync::mpsc::{self, Receiver, SyncSender},
     time::Instant,
 };
 use windows_sys::Win32::{
@@ -126,6 +127,9 @@ struct View {
     redo: Vec<Mark>,
     point: [i32; 2],
     detect_at: Instant,
+    detector: Option<Detector>,
+    background: Option<PaintSurface>,
+    backbuffer: Option<PaintSurface>,
     font: HFONT,
     alpha: u8,
     recognition: Option<Recognition>,
@@ -168,6 +172,110 @@ struct LongCapture {
     paused: bool,
     status: String,
     hotkeys: Vec<i32>,
+}
+
+// GDI surfaces stay on the UI thread and are released with their view.
+struct PaintSurface {
+    dc: HDC,
+    bitmap: HBITMAP,
+    previous: HGDIOBJ,
+    size: [i32; 2],
+}
+impl PaintSurface {
+    unsafe fn new(target: HDC, size: [i32; 2]) -> Option<Self> {
+        let dc = CreateCompatibleDC(target);
+        if dc.is_null() {
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(target, size[0].max(1), size[1].max(1));
+        if bitmap.is_null() {
+            DeleteDC(dc);
+            return None;
+        }
+        let previous = SelectObject(dc, bitmap);
+        Some(Self {
+            dc,
+            bitmap,
+            previous,
+            size,
+        })
+    }
+}
+impl Drop for PaintSurface {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.previous);
+            DeleteObject(self.bitmap);
+            DeleteDC(self.dc);
+        }
+    }
+}
+
+struct Detector {
+    request: SyncSender<[i32; 2]>,
+    result: Receiver<([i32; 2], [i32; 4])>,
+    pending: bool,
+    last_point: Option<[i32; 2]>,
+}
+impl Detector {
+    fn new(screen: RECT, detailed: bool) -> Self {
+        let (request, requests) = mpsc::sync_channel::<[i32; 2]>(1);
+        let (results, result) = mpsc::sync_channel(1);
+        std::thread::spawn(move || unsafe {
+            use windows::Win32::System::Com::{
+                COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize,
+            };
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let initialized = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+            while let Ok(point) = requests.recv() {
+                let r = detect(point, screen, detailed && initialized);
+                if results
+                    .send((point, [r.left, r.top, r.right, r.bottom]))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            if initialized {
+                CoUninitialize();
+            }
+        });
+        Self {
+            request,
+            result,
+            pending: false,
+            last_point: None,
+        }
+    }
+}
+
+unsafe fn update_detection(hwnd: HWND, data: &mut View) {
+    let Some(detector) = &mut data.detector else {
+        return;
+    };
+    if let Ok((point, bounds)) = detector.result.try_recv() {
+        detector.pending = false;
+        if !data.dragging && data.selection.right <= data.selection.left && point == data.point {
+            data.hover = RECT {
+                left: bounds[0],
+                top: bounds[1],
+                right: bounds[2],
+                bottom: bounds[3],
+            };
+            InvalidateRect(hwnd, null(), 0);
+        }
+    }
+    if !data.dragging
+        && data.selection.right <= data.selection.left
+        && !detector.pending
+        && detector.last_point != Some(data.point)
+        && data.detect_at.elapsed().as_millis() >= 80
+        && detector.request.try_send(data.point).is_ok()
+    {
+        detector.pending = true;
+        detector.last_point = Some(data.point);
+        data.detect_at = Instant::now();
+    }
 }
 
 unsafe fn app(hwnd: HWND) -> *mut App {
@@ -344,6 +452,9 @@ fn empty_view(image: RgbaImage) -> Box<View> {
         redo: vec![],
         point: [0, 0],
         detect_at: Instant::now(),
+        detector: None,
+        background: None,
+        backbuffer: None,
         font: null_mut(),
         alpha: 255,
         recognition: None,
@@ -382,6 +493,7 @@ unsafe fn pin(
     image: RgbaImage,
     animate: Option<PathBuf>,
     remember: bool,
+    origin: Option<[i32; 2]>,
 ) -> Result<HWND> {
     if remember {
         store(state, &image, "贴图")?;
@@ -405,6 +517,20 @@ unsafe fn pin(
         right: 0,
         bottom: 0,
     };
+    let r = origin
+        .and_then(|[x, y]| {
+            Some(RECT {
+                left: x.checked_sub(2)?,
+                top: y.checked_sub(2)?,
+                right: x.checked_add(image.width() as i32)?.checked_add(2)?,
+                bottom: y.checked_add(image.height() as i32)?.checked_add(2)?,
+            })
+        })
+        .unwrap_or(RECT {
+            right: r.left + width,
+            bottom: r.top + height,
+            ..r
+        });
     let mut data = empty_view(image);
     data.file = animate.clone();
     data.animation =
@@ -413,11 +539,7 @@ unsafe fn pin(
         state,
         data,
         "ptools 贴图 · 空格标注 · 右键菜单 · Esc关闭",
-        RECT {
-            right: r.left + width,
-            bottom: r.top + height,
-            ..r
-        },
+        r,
         false,
     );
     if hwnd.is_null() {
@@ -450,7 +572,8 @@ fn frames(path: &Path) -> Result<Frames> {
         _ => Err("不是动图".into()),
     }
 }
-unsafe fn clipboard_image(hwnd: HWND) -> Result<(RgbaImage, Option<PathBuf>)> {
+type ClipboardImage = (RgbaImage, Option<PathBuf>, Option<[i32; 2]>);
+unsafe fn clipboard_image(hwnd: HWND) -> Result<ClipboardImage> {
     if OpenClipboard(hwnd) == 0 {
         return Err("剪贴板正被其他程序占用".into());
     }
@@ -461,14 +584,14 @@ unsafe fn clipboard_image(hwnd: HWND) -> Result<(RgbaImage, Option<PathBuf>)> {
             let len = DragQueryFileW(drop, 0, path.as_mut_ptr(), path.len() as u32);
             let path = PathBuf::from(String::from_utf16_lossy(&path[..len as usize]));
             if let Ok(image) = image::open(&path) {
-                return Ok((image.to_rgba8(), Some(path)));
+                return Ok((image.to_rgba8(), Some(path), None));
             }
             return text_image(&format!(
                 "{}\n{}",
                 path.file_name().unwrap_or_default().to_string_lossy(),
                 path.display()
             ))
-            .map(|i| (i, Some(path)));
+            .map(|i| (i, Some(path), None));
         }
         let bitmap = GetClipboardData(2);
         if !bitmap.is_null() {
@@ -504,10 +627,9 @@ unsafe fn clipboard_image(hwnd: HWND) -> Result<(RgbaImage, Option<PathBuf>)> {
                         p.swap(0, 2);
                         p[3] = 255;
                     }
-                    return Ok((
-                        RgbaImage::from_raw(width as u32, height as u32, pixels).unwrap(),
-                        None,
-                    ));
+                    let image = RgbaImage::from_raw(width as u32, height as u32, pixels).unwrap();
+                    let origin = clipboard_image_origin(&image);
+                    return Ok((image, None, origin));
                 }
             }
         }
@@ -525,23 +647,14 @@ unsafe fn clipboard_image(hwnd: HWND) -> Result<(RgbaImage, Option<PathBuf>)> {
     } else {
         text_image(&text)?
     };
-    Ok((image, None))
+    Ok((image, None, None))
 }
 unsafe fn quick_pin(state: &mut App, image: RgbaImage, region: RECT) -> Result<()> {
     store(state, &image, "截图")?;
-    let copied = copy_image(state.hwnd, &image);
-    let width = image.width() as i32;
-    let height = image.height() as i32;
-    let window = pin(state, image, None, false)?;
-    SetWindowPos(
-        window,
-        HWND_TOPMOST,
-        region.left - 2,
-        region.top - 2,
-        width + 4,
-        height + 4,
-        SWP_NOACTIVATE,
-    );
+    let inset = if state.settings.shadow { 8 } else { 0 };
+    let origin = [region.left - inset, region.top - inset];
+    let copied = copy_image_at(state.hwnd, &image, Some(origin));
+    pin(state, image, None, false, Some(origin))?;
     copied
 }
 
@@ -674,6 +787,7 @@ unsafe fn capture(state: &mut App, custom: bool, quick: bool) -> Result<()> {
     let mut data = empty_view(image);
     data.screen = Some(r);
     data.quick = quick;
+    data.detector = Some(Detector::new(r, state.settings.detect_ui));
     let title = if quick {
         "ptools 快速截图 · 松开鼠标贴图"
     } else {
@@ -832,6 +946,16 @@ unsafe fn detect(p: [i32; 2], screen: RECT, detailed: bool) -> RECT {
         right: (r.right - screen.left).clamp(0, screen.right - screen.left),
         bottom: (r.bottom - screen.top).clamp(0, screen.bottom - screen.top),
     }
+}
+
+unsafe fn capture_origin(data: &View) -> Option<[i32; 2]> {
+    data.screen.map(|screen| {
+        let inset = if (*data.app).settings.shadow { 8 } else { 0 };
+        [
+            screen.left + data.selection.left - inset,
+            screen.top + data.selection.top - inset,
+        ]
+    })
 }
 
 unsafe fn rendered(data: &View) -> Result<RgbaImage> {
@@ -1587,7 +1711,16 @@ unsafe fn finish_long(hwnd: HWND, id: usize) -> Result<()> {
             }
             202 => {
                 store(&*data.app, &image, "长截图")?;
-                pin(&mut *data.app, image.clone(), None, false)?;
+                pin(
+                    &mut *data.app,
+                    image.clone(),
+                    None,
+                    false,
+                    Some([
+                        data.long.as_ref().unwrap().region.left,
+                        data.long.as_ref().unwrap().region.top,
+                    ]),
+                )?;
             }
             _ => {
                 store(&*data.app, &image, "长截图")?;
@@ -1674,7 +1807,7 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
         }
         9 => {
             let image = rendered(data)?;
-            copy_image(hwnd, &image)?;
+            copy_image_at(hwnd, &image, capture_origin(data))?;
             if data.screen.is_some() {
                 store(state, &image, "截图")?;
                 DestroyWindow(hwnd);
@@ -1685,7 +1818,13 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
             if data.screen.is_some() {
                 store(state, &image, "截图")?;
             }
-            pin(state, image, None, data.screen.is_none())?;
+            pin(
+                state,
+                image,
+                None,
+                data.screen.is_none(),
+                capture_origin(data),
+            )?;
             if data.screen.is_some() {
                 DestroyWindow(hwnd);
             }
@@ -2099,8 +2238,19 @@ unsafe extern "system" fn controller_proc(
                         None => capture(&mut *state, false, true),
                     },
                     "pin" => {
-                        let (image, path) = clipboard_image(hwnd)?;
-                        pin(&mut *state, image, path, true)?;
+                        let active = (*state).windows.iter().copied().find(|window| {
+                            let data = &*view(*window as HWND);
+                            data.screen.is_some()
+                                && data.long.is_none()
+                                && data.selection.right > data.selection.left
+                                && data.selection.bottom > data.selection.top
+                        });
+                        if let Some(window) = active {
+                            command(window as HWND, 10)?;
+                        } else {
+                            let (image, path, origin) = clipboard_image(hwnd)?;
+                            pin(&mut *state, image, path, true, origin)?;
+                        }
                         Ok(())
                     }
                     "history" => history(&mut *state),
@@ -2153,7 +2303,7 @@ unsafe extern "system" fn controller_proc(
                     };
                     let image = rendered(&data)?;
                     store(&*state, &image, "截图")?;
-                    copy_image(hwnd, &image)
+                    copy_image_at(hwnd, &image, capture_origin(&data))
                 })
             } else {
                 capture(&mut *state, false, false)
@@ -2216,6 +2366,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 wide("Microsoft YaHei").as_ptr(),
             );
             SetTimer(hwnd, 6, 250, None);
+            if data.detector.is_some() {
+                SetTimer(hwnd, 7, 16, None);
+            }
             return 0;
         }
         WM_PAINT | WM_PRINTCLIENT => {
@@ -2234,12 +2387,36 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
                 return 0;
             }
-            let dc = CreateCompatibleDC(target_dc);
-            let bitmap =
-                CreateCompatibleBitmap(target_dc, client.right.max(1), client.bottom.max(1));
-            let previous_bitmap = SelectObject(dc, bitmap);
+            let size = [client.right.max(1), client.bottom.max(1)];
+            if data
+                .backbuffer
+                .as_ref()
+                .is_none_or(|surface| surface.size != size)
+            {
+                data.backbuffer = PaintSurface::new(target_dc, size);
+                data.background = None;
+            }
+            let Some(buffer) = &data.backbuffer else {
+                if message == WM_PAINT {
+                    EndPaint(hwnd, &paint);
+                }
+                return 0;
+            };
+            let dc = buffer.dc;
             let saved = SaveDC(dc);
-            if data.screen.is_none() && !data.marks.is_empty() {
+            if data.screen.is_some() {
+                if data.background.is_none() {
+                    data.background = PaintSurface::new(target_dc, size);
+                    if let Some(background) = &data.background {
+                        draw_image(background.dc, &data.image, [0, 0, size[0], size[1]]);
+                    }
+                }
+                if let Some(background) = &data.background {
+                    BitBlt(dc, 0, 0, size[0], size[1], background.dc, 0, 0, SRCCOPY);
+                } else {
+                    draw_image(dc, &data.image, [0, 0, size[0], size[1]]);
+                }
+            } else if !data.marks.is_empty() {
                 if let Ok(image) = render_image(data, false) {
                     draw_image(dc, &image, [2, 2, client.right - 4, client.bottom - 4]);
                 }
@@ -2500,9 +2677,6 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 0,
                 SRCCOPY,
             );
-            SelectObject(dc, previous_bitmap);
-            DeleteObject(bitmap);
-            DeleteDC(dc);
             if message == WM_PAINT {
                 EndPaint(hwnd, &paint);
             }
@@ -2702,13 +2876,8 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                         *mark.points.last_mut().unwrap() = image_p;
                     }
                 }
-            } else if let Some(screen) = data.screen
-                && data.selection.right <= data.selection.left
-                && data.detect_at.elapsed().as_millis() > 80
-            {
-                data.hover = detect(p, screen, (*data.app).settings.detect_ui);
-                data.detect_at = Instant::now();
             }
+            update_detection(hwnd, data);
             InvalidateRect(hwnd, null(), 0);
             return 0;
         }
@@ -3232,6 +3401,10 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             sample_long(hwnd);
             return 0;
         }
+        WM_TIMER if w == 7 => {
+            update_detection(hwnd, data);
+            return 0;
+        }
         WM_TIMER if w == 6 => {
             if data.text_selection_enabled
                 && !data.recognition_pending
@@ -3366,7 +3539,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 if let Ok(store) = History::new(&state.root, state.settings.history_days)
                     && let Ok(image) = store.load(&item.id, false)
                 {
-                    let _ = pin(state, image, None, false);
+                    let _ = pin(state, image, None, false, None);
                 }
             }
             return 0;
@@ -3559,6 +3732,125 @@ pub fn vertical_shift(previous: &RgbaImage, next: &RgbaImage) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_detection_does_not_wait_and_stale_results_cannot_move_selection() {
+        unsafe {
+            let mut data = empty_view(RgbaImage::new(300, 200));
+            let (request, requests) = mpsc::sync_channel(1);
+            let (results, result) = mpsc::sync_channel(1);
+            data.detector = Some(Detector {
+                request,
+                result,
+                pending: false,
+                last_point: None,
+            });
+            data.point = [40, 50];
+            data.detect_at = Instant::now() - std::time::Duration::from_secs(1);
+            update_detection(null_mut(), &mut data);
+            assert_eq!(requests.try_recv().unwrap(), [40, 50]);
+            let started = Instant::now();
+            for _ in 0..1000 {
+                update_detection(null_mut(), &mut data);
+            }
+            assert!(
+                started.elapsed().as_millis() < 100,
+                "UI waited for detector"
+            );
+            data.point = [60, 70];
+            results.send(([40, 50], [10, 20, 80, 90])).unwrap();
+            update_detection(null_mut(), &mut data);
+            assert_eq!(data.hover.right, 0, "stale detection applied");
+            data.selection = RECT {
+                left: 30,
+                top: 30,
+                right: 180,
+                bottom: 160,
+            };
+            results.send(([60, 70], [10, 20, 80, 90])).unwrap();
+            update_detection(null_mut(), &mut data);
+            assert_eq!(
+                data.hover.right, 0,
+                "detection replaced a committed selection"
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_pin_preserves_origin_size_and_shadow_offset() {
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let mut data = empty_view(RgbaImage::new(500, 300));
+            data.app = &mut state;
+            data.screen = Some(RECT {
+                left: -1920,
+                top: -200,
+                right: 0,
+                bottom: 880,
+            });
+            data.selection = RECT {
+                left: 120,
+                top: 80,
+                right: 420,
+                bottom: 280,
+            };
+            assert_eq!(capture_origin(&data), Some([-1800, -120]));
+            state.settings.shadow = true;
+            assert_eq!(capture_origin(&data), Some([-1808, -128]));
+            state.settings.shadow = false;
+            let window = pin(
+                &mut state,
+                RgbaImage::new(300, 200),
+                None,
+                false,
+                Some([240, 180]),
+            )
+            .unwrap();
+            let mut bounds = RECT::default();
+            GetWindowRect(window, &mut bounds);
+            assert_eq!(
+                [bounds.left, bounds.top, bounds.right, bounds.bottom],
+                [238, 178, 542, 382]
+            );
+            DestroyWindow(window);
+            assert!(state.windows.is_empty());
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode GDI benchmark"]
+    fn benchmark_cached_capture_background() {
+        unsafe {
+            let screen = GetDC(null_mut());
+            let source = PaintSurface::new(screen, [3840, 2160]).unwrap();
+            let target = PaintSurface::new(screen, [3840, 2160]).unwrap();
+            let image = RgbaImage::from_pixel(3840, 2160, Rgba([37, 81, 149, 255]));
+            draw_image(source.dc, &image, [0, 0, 3840, 2160]);
+            let start = Instant::now();
+            for _ in 0..30 {
+                draw_image(target.dc, &image, [0, 0, 3840, 2160]);
+            }
+            GdiFlush();
+            let old = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
+            let start = Instant::now();
+            for _ in 0..30 {
+                BitBlt(target.dc, 0, 0, 3840, 2160, source.dc, 0, 0, SRCCOPY);
+            }
+            GdiFlush();
+            let cached = start.elapsed().as_secs_f64() * 1000.0 / 30.0;
+            assert_eq!(GetPixel(source.dc, 100, 100), GetPixel(target.dc, 100, 100));
+            eprintln!("4K background mean: legacy={old:.3}ms cached={cached:.3}ms");
+            ReleaseDC(null_mut(), screen);
+        }
+    }
+
     #[test]
     fn each_annotation_changes_exported_pixels_and_keeps_its_own_style() {
         let mut data = empty_view(RgbaImage::from_fn(240, 160, |x, y| {

@@ -98,13 +98,13 @@ fn parse_token(text: &str) -> Option<String> {
     };
     for line in &lines {
         let line = line.strip_prefix("export ").unwrap_or(line).trim();
-        if let Some((key, value)) = line.split_once(['=', ':', '：']) {
-            if matches!(
+        if let Some((key, value)) = line.split_once(['=', ':', '：'])
+            && matches!(
                 key.trim().to_ascii_uppercase().replace('-', "_").as_str(),
                 "PTOOLS_UPDATE_TOKEN" | "FORGEJO_TOKEN" | "GITEA_TOKEN" | "TOKEN" | "令牌"
-            ) {
-                return clean(value);
-            }
+            )
+        {
+            return clean(value);
         }
     }
     if lines.len() == 1 && !lines[0].contains(['=', ':', '：']) {
@@ -159,10 +159,11 @@ fn fetch(url: &str, api: &str, source: &str, limit: u64, timeout: u64) -> Result
         .get(url)
         .header("User-Agent", "ptools-updater")
         .header("Accept", "application/octet-stream, application/json");
-    if source == "内网" && destination == origin(api)? {
-        if let Some(token) = update_token() {
-            request = request.header("Authorization", format!("token {token}"));
-        }
+    if source == "内网"
+        && destination == origin(api)?
+        && let Some(token) = update_token()
+    {
+        request = request.header("Authorization", format!("token {token}"));
     }
     // ureq's default redirect policy strips Authorization on cross-origin hops.
     let mut response = request.call().map_err(|e| match e {
@@ -247,16 +248,16 @@ fn verify_checksum(bytes: &[u8], sums: &[u8], filename: &str) -> Result<()> {
     let mut expected = None;
     for line in text.lines() {
         let mut fields = line.split_whitespace();
-        if let (Some(hash), Some(name), None) = (fields.next(), fields.next(), fields.next()) {
-            if name.trim_start_matches('*') == filename {
-                if expected.is_some()
-                    || hash.len() != 64
-                    || !hash.bytes().all(|b| b.is_ascii_hexdigit())
-                {
-                    return Err("校验文件内容错误".into());
-                }
-                expected = Some(hash.to_ascii_lowercase());
+        if let (Some(hash), Some(name), None) = (fields.next(), fields.next(), fields.next())
+            && name.trim_start_matches('*') == filename
+        {
+            if expected.is_some()
+                || hash.len() != 64
+                || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("校验文件内容错误".into());
             }
+            expected = Some(hash.to_ascii_lowercase());
         }
     }
     let expected = expected.ok_or("校验文件未包含完整软件包")?;

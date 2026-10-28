@@ -324,6 +324,16 @@ impl Drop for ClipboardMemory {
 /// # Safety
 /// `hwnd` must identify a live window on the calling thread.
 pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
+    copy_image_at(hwnd, image, None)
+}
+
+/// # Safety
+/// `hwnd` must identify a live window on the calling thread.
+pub unsafe fn copy_image_at(
+    hwnd: HWND,
+    image: &RgbaImage,
+    origin: Option<[i32; 2]>,
+) -> Result<(), String> {
     let (png_bytes, dib_bytes) = clipboard_image_data(image)?;
     let png_format = RegisterClipboardFormatW(wide("PNG").as_ptr());
     if png_format == 0 {
@@ -332,6 +342,19 @@ pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
     // Prepare both representations before replacing the user's clipboard.
     let png = ClipboardMemory::new(&png_bytes)?;
     let dib = ClipboardMemory::new(&dib_bytes)?;
+    let position = if let Some([x, y]) = origin {
+        let format = RegisterClipboardFormatW(wide("ptools.capture.origin.v1").as_ptr());
+        if format == 0 {
+            return Err("无法注册截图位置格式".into());
+        }
+        let bytes: Vec<u8> = [x, y, image.width() as i32, image.height() as i32]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        Some((format, ClipboardMemory::new(&bytes)?))
+    } else {
+        None
+    };
     if !open_clipboard(hwnd) {
         return Err("剪贴板正被其他程序占用，请重试".into());
     }
@@ -342,10 +365,44 @@ pub unsafe fn copy_image(hwnd: HWND, image: &RgbaImage) -> Result<(), String> {
         // PNG first preserves alpha for applications using format order.
         png.publish(png_format)?;
         dib.publish(17)?; // CF_DIBV5; Windows synthesizes CF_DIB / CF_BITMAP.
+        if let Some((format, memory)) = position {
+            memory.publish(format)?;
+        }
         Ok(())
     })();
     CloseClipboard();
     result
+}
+
+/// # Safety
+/// Call while the clipboard is open on this thread.
+pub unsafe fn clipboard_image_origin(image: &RgbaImage) -> Option<[i32; 2]> {
+    let format = RegisterClipboardFormatW(wide("ptools.capture.origin.v1").as_ptr());
+    if format == 0 {
+        return None;
+    }
+    let memory = GetClipboardData(format);
+    if memory.is_null() || GlobalSize(memory) < 16 {
+        return None;
+    }
+    let ptr = GlobalLock(memory).cast::<u8>();
+    if ptr.is_null() {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, 16);
+    let origin = decode_image_origin(bytes, image.dimensions());
+    GlobalUnlock(memory);
+    origin
+}
+fn decode_image_origin(bytes: &[u8], size: (u32, u32)) -> Option<[i32; 2]> {
+    let bytes: &[u8; 16] = bytes.try_into().ok()?;
+    let values: Vec<_> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
+        .collect();
+    (values[2] as u32 == size.0 && values[3] as u32 == size.1).then_some([values[0], values[1]])
 }
 /// # Safety
 /// Call on an initialized desktop UI thread with physical screen coordinates.
@@ -826,6 +883,18 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str, multiline: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_origin_keeps_negative_coordinates_and_rejects_wrong_image_sizes() {
+        let bytes: Vec<u8> = [-1800i32, -240, 320, 180]
+            .into_iter()
+            .flat_map(i32::to_le_bytes)
+            .collect();
+        assert_eq!(decode_image_origin(&bytes, (320, 180)), Some([-1800, -240]));
+        assert_eq!(decode_image_origin(&bytes, (180, 320)), None);
+        assert_eq!(decode_image_origin(&bytes[..12], (320, 180)), None);
+        assert_eq!(decode_image_origin(&[], (320, 180)), None);
+    }
 
     #[test]
     fn clipboard_png_and_dib_decode_with_matching_orientation_color_and_alpha() {

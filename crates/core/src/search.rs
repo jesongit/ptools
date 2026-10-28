@@ -1,4 +1,4 @@
-use crate::{Cache, Entry, Settings, now};
+use crate::{Cache, Entry, Settings};
 use pinyin::ToPinyin;
 
 #[derive(Clone, Debug)]
@@ -56,7 +56,6 @@ fn subsequence(needle: &str, haystack: &str) -> bool {
 pub fn search(index: &[SearchEntry], query: &str, settings: &Settings, limit: usize) -> Vec<usize> {
     let query = query.trim().to_lowercase();
     let terms: Vec<&str> = query.split_whitespace().collect();
-    let now = now();
     let mut scored = Vec::new();
     for (i, item) in index.iter().enumerate() {
         let mut score = 0i64;
@@ -86,26 +85,83 @@ pub fn search(index: &[SearchEntry], query: &str, settings: &Settings, limit: us
         if !matches {
             continue;
         }
-        if let Some(usage) = settings.usage.get(&item.key) {
-            score += i64::from(usage.count.min(100)) * 3;
-            score += 300i64
-                .saturating_sub((now.saturating_sub(usage.last_used) / 86400) as i64)
-                .max(0);
-        }
-        scored.push((i, score));
+        let usage = settings.usage.get(&item.key).cloned().unwrap_or_default();
+        scored.push((i, score, usage.count, usage.last_used));
     }
-    scored.sort_by(|(a, sa), (b, sb)| {
-        sb.cmp(sa)
+    scored.sort_by(|(a, sa, ca, ta), (b, sb, cb, tb)| {
+        cb.cmp(ca)
+            .then_with(|| sb.cmp(sa))
+            .then_with(|| tb.cmp(ta))
             .then_with(|| index[*a].title.cmp(&index[*b].title))
             .then(a.cmp(b))
     });
-    scored.into_iter().take(limit).map(|(i, _)| i).collect()
+    scored.into_iter().take(limit).map(|(i, ..)| i).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Target, Usage};
+    use crate::{Target, Usage, now};
+    #[test]
+    fn frequency_orders_only_matching_entries_without_count_cap() {
+        let mut cache = Cache::default();
+        cache.plugins.insert(
+            "apps".into(),
+            ["Code", "Visual Studio Code", "微信"]
+                .iter()
+                .enumerate()
+                .map(|(i, title)| Entry {
+                    id: i.to_string(),
+                    title: title.to_string(),
+                    subtitle: String::new(),
+                    keywords: vec![],
+                    target: Target::Url {
+                        url: "https://example.com".into(),
+                    },
+                })
+                .collect(),
+        );
+        let mut settings = Settings::default();
+        let index = build_index(&cache, &settings);
+        settings.usage.insert(
+            "apps:0".into(),
+            Usage {
+                count: 101,
+                last_used: now(),
+            },
+        );
+        settings.usage.insert(
+            "apps:1".into(),
+            Usage {
+                count: 102,
+                last_used: 1,
+            },
+        );
+        settings.usage.insert(
+            "apps:2".into(),
+            Usage {
+                count: 10000,
+                last_used: now(),
+            },
+        );
+        let titles = |query: &str, settings: &Settings| {
+            search(&index, query, settings, 50)
+                .iter()
+                .map(|&i| index[i].entry.title.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(titles("code", &settings), ["Visual Studio Code", "Code"]);
+        assert_eq!(titles("visual code", &settings), ["Visual Studio Code"]);
+        assert_eq!(titles("wx", &settings), ["微信"]);
+        assert_eq!(
+            titles("", &settings),
+            ["微信", "Visual Studio Code", "Code"]
+        );
+        settings.usage.get_mut("apps:0").unwrap().count = 102;
+        assert_eq!(titles("code", &settings), ["Code", "Visual Studio Code"]);
+        settings.usage.clear();
+        assert_eq!(titles("code", &settings), ["Code", "Visual Studio Code"]);
+    }
     #[test]
     fn chinese_pinyin_initials_and_usage() {
         let entries = ["微信", "Visual Studio Code", "计算器"]

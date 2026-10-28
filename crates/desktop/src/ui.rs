@@ -32,7 +32,7 @@ const WM_SHOW: u32 = WM_APP + 1;
 const WM_WORK: u32 = WM_APP + 2;
 const WM_TRAY: u32 = WM_APP + 3;
 const WM_KEY_ACTION: u32 = WM_APP + 4;
-const WM_NUMBER_ACTION: u32 = WM_APP + 5;
+const WM_REFRESH_ACTION: u32 = WM_APP + 5;
 const HOTKEY_ID: i32 = 101;
 const EDIT_ID: usize = 201;
 const LIST_ID: usize = 202;
@@ -910,7 +910,7 @@ unsafe fn rebuild(hwnd: HWND) {
                     if (*s).settings.usage.contains_key(&hit.key) {
                         rows.push(Row {
                             title: hit.entry.title.clone(),
-                            subtitle: "最近使用".into(),
+                            subtitle: "常用应用".into(),
                             badge: entry_badge(&hit.entry).into(),
                             action: Action::Launch(Box::new(hit)),
                         });
@@ -1930,28 +1930,11 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
             theme::ACCENT,
         );
     }
-    let (top, visible) = visible_rows((*s).list);
-    let slot = draw.itemID as isize - top;
-    if slot >= 0 && slot < visible {
-        let number_rect = RECT {
-            left: rect.left + px(s, 6),
-            right: rect.left + px(s, 30),
-            ..rect
-        };
-        draw_text(
-            draw.hDC,
-            &(slot + 1).to_string(),
-            number_rect,
-            (*s).small_font,
-            theme::MUTED,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
-    }
     let icon = app_icon(hwnd, s, &row);
     if !icon.is_null() {
         DrawIconEx(
             draw.hDC,
-            rect.left + px(s, 38),
+            rect.left + px(s, 14),
             rect.top + px(s, 13),
             icon,
             px(s, 30),
@@ -1962,7 +1945,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
         );
     } else {
         let mut badge = rect;
-        badge.left += px(s, 34);
+        badge.left += px(s, 10);
         badge.right = badge.left + px(s, 40);
         let glyph = match row.action {
             Action::Launch(_) => "↗",
@@ -1978,7 +1961,7 @@ unsafe fn draw_row(hwnd: HWND, draw: &DRAWITEMSTRUCT) {
         );
     }
     let title_rect = RECT {
-        left: rect.left + px(s, 82),
+        left: rect.left + px(s, 58),
         top: rect.top + px(s, 8),
         right: rect.right - px(s, 44),
         bottom: rect.top + px(s, 31),
@@ -2168,7 +2151,7 @@ unsafe fn paint(hwnd: HWND) {
                 "↵ 复制   Ctrl+Shift+C 复制   Esc 返回"
             }
         } else {
-            "Alt+数字 / ↑↓ / Ctrl+J/K 选择   ↵ 打开   Esc 返回"
+            "↑↓ / Ctrl+J/K 选择   ↵ 打开   Ctrl+R 刷新   Esc 返回"
         },
         hints,
         (*s).small_font,
@@ -2297,7 +2280,7 @@ unsafe extern "system" fn button_proc(
     _id: usize,
     parent: usize,
 ) -> LRESULT {
-    if number_shortcut(parent as HWND, msg, w, l) {
+    if refresh_shortcut(parent as HWND, msg, w, l) {
         return 0;
     }
     let s = state(parent as HWND);
@@ -2320,39 +2303,23 @@ unsafe extern "system" fn button_proc(
     DefSubclassProc(hwnd, msg, w, l)
 }
 
-unsafe fn visible_rows(list: HWND) -> (isize, isize) {
-    let top = SendMessageW(list, LB_GETTOPINDEX, 0, 0).max(0);
-    let height = SendMessageW(list, LB_GETITEMHEIGHT, 0, 0).max(1);
-    let count = SendMessageW(list, LB_GETCOUNT, 0, 0).max(0);
-    let mut client: RECT = zeroed();
-    GetClientRect(list, &mut client);
-    let visible = ((client.bottom - client.top) as isize / height)
-        .min((count - top).max(0))
-        .clamp(0, 9);
-    (top, visible)
-}
-
-unsafe fn number_shortcut(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
+unsafe fn refresh_shortcut(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> bool {
     let s = state(hwnd);
     if s.is_null()
         || (*s).composing
-        || !(0x31..=0x39).contains(&w)
-        || l & (1 << 29) == 0
-        || GetKeyState(VK_CONTROL as i32) < 0
+        || GetKeyState(VK_CONTROL as i32) >= 0
+        || GetKeyState(VK_MENU as i32) < 0
         || GetKeyState(VK_SHIFT as i32) < 0
     {
         return false;
     }
-    match msg {
-        WM_SYSKEYDOWN => {
-            // Ignore key-repeat; a numbered shortcut only changes the selection.
-            if l & (1 << 30) == 0 {
-                PostMessageW(hwnd, WM_NUMBER_ACTION, w - 0x31, 0);
-            }
-            true
+    if msg == WM_KEYDOWN && w == 0x52 {
+        if l & (1 << 30) == 0 {
+            PostMessageW(hwnd, WM_REFRESH_ACTION, 0, 0);
         }
-        WM_SYSCHAR | WM_SYSKEYUP => true,
-        _ => false,
+        true
+    } else {
+        msg == WM_CHAR && w == 0x12
     }
 }
 
@@ -2364,24 +2331,10 @@ unsafe extern "system" fn list_proc(
     _id: usize,
     parent: usize,
 ) -> LRESULT {
-    if number_shortcut(parent as HWND, msg, w, l) {
+    if refresh_shortcut(parent as HWND, msg, w, l) {
         return 0;
     }
-    let scrolling = matches!(
-        msg,
-        WM_VSCROLL | WM_MOUSEWHEEL | LB_SETTOPINDEX | LB_SETCURSEL
-    );
-    let top = if scrolling {
-        SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0)
-    } else {
-        0
-    };
-    let result = DefSubclassProc(hwnd, msg, w, l);
-    if scrolling && top != SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0) {
-        // Native scrolling can reuse old pixels; redraw labels against the new top row.
-        InvalidateRect(hwnd, null(), 0);
-    }
-    result
+    DefSubclassProc(hwnd, msg, w, l)
 }
 
 unsafe fn result_copy_shortcut(hwnd: HWND, msg: u32, w: WPARAM) -> bool {
@@ -2431,6 +2384,9 @@ unsafe extern "system" fn result_control_proc(
     parent: usize,
 ) -> LRESULT {
     let parent = parent as HWND;
+    if refresh_shortcut(parent, msg, w, l) {
+        return 0;
+    }
     if result_copy_shortcut(parent, msg, w) {
         return 0;
     }
@@ -2479,7 +2435,7 @@ unsafe extern "system" fn edit_proc(
     if result_copy_shortcut(parent, msg, w) {
         return 0;
     }
-    if number_shortcut(parent, msg, w, l) {
+    if refresh_shortcut(parent, msg, w, l) {
         return 0;
     }
     match msg {
@@ -2569,7 +2525,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     if s.is_null() {
         return DefWindowProcW(hwnd, msg, w, l);
     }
-    if number_shortcut(hwnd, msg, w, l) {
+    if refresh_shortcut(hwnd, msg, w, l) {
         return 0;
     }
     if msg == (*s).taskbar_message {
@@ -2730,13 +2686,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             return 0;
         }
-        WM_NUMBER_ACTION => {
-            let (top, visible) = visible_rows((*s).list);
-            if !(*s).composing && w < visible as usize {
-                SendMessageW((*s).list, LB_SETCURSEL, top as usize + w, 0);
-                InvalidateRect((*s).list, null(), 0);
-                SetFocus((*s).edit);
-            }
+        WM_REFRESH_ACTION => {
+            start_refresh(hwnd);
             return 0;
         }
         WM_KEY_ACTION => {
@@ -2790,15 +2741,6 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_HOTKEY => {
             if let Some((id, action)) = (*s).plugin_hotkeys.get(&(w as i32)).cloned() {
-                let modifiers = l as u32 & 0xffff;
-                let key = (l as u32 >> 16) & 0xffff;
-                if IsWindowVisible(hwnd) != 0
-                    && modifiers == MOD_ALT
-                    && (0x31..=0x39).contains(&key)
-                {
-                    PostMessageW(hwnd, WM_NUMBER_ACTION, (key - 0x31) as usize, 0);
-                    return 0;
-                }
                 hide(hwnd, false);
                 if let Err(e) = (*s)
                     .sessions
