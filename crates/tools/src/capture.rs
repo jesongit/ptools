@@ -31,6 +31,7 @@ const WM_COMMIT_TEXT: u32 = WM_APP + 23;
 mod long_panel;
 mod text_editor;
 mod toolbar;
+mod tooltip;
 
 const LONG_HOTKEYS: [(i32, u32, u32, usize); 5] = [
     (301, MOD_NOREPEAT, VK_RETURN as u32, 201),
@@ -153,6 +154,9 @@ struct View {
     editing: bool,
     toolbar_window: HWND,
     hover_button: Option<usize>,
+    slider_window: HWND,
+    tooltip_window: HWND,
+    tooltip_text: String,
     group_tools: [usize; 3],
     selection_drag: u8,
     selection_origin: RECT,
@@ -656,6 +660,9 @@ fn empty_view(image: RgbaImage) -> Box<View> {
         editing: false,
         toolbar_window: null_mut(),
         hover_button: None,
+        slider_window: null_mut(),
+        tooltip_window: null_mut(),
+        tooltip_text: String::new(),
         group_tools: [1, 3, 4],
         selection_drag: 0,
         selection_origin: RECT::default(),
@@ -1933,6 +1940,7 @@ unsafe fn finish_long(hwnd: HWND, id: usize) -> Result<()> {
 
 unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
     let data = &mut *view(hwnd);
+    tooltip::hide(data);
     if data.long.is_some() {
         return finish_long(
             hwnd,
@@ -2915,6 +2923,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_LBUTTONDOWN => {
+            tooltip::hide(data);
             if data.long.is_some() {
                 return 0;
             }
@@ -3029,6 +3038,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_MOUSEMOVE => {
+            if toolbar::drag_slider(hwnd, hwnd, point(l), false) {
+                return 0;
+            }
             if data.long.is_some() {
                 return 0;
             }
@@ -3036,11 +3048,12 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             let p = point(l);
             let image_p = image_point(hwnd, data, p);
             data.point = p;
-            data.hover_button = if toolbar::visible(data) {
-                toolbar::layout(hwnd, data).hit(p)
+            if toolbar::visible(data) && contains(toolbar::layout(hwnd, data).bounds, p) {
+                let hit = toolbar::layout(hwnd, data).hit(p);
+                tooltip::hover(hwnd, hwnd, hit);
             } else {
-                None
-            };
+                tooltip::leave(data);
+            }
             if data.polyline_active
                 && toolbar::visible(data)
                 && contains(toolbar::layout(hwnd, data).bounds, p)
@@ -3114,6 +3127,16 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             invalidate_capture_change(hwnd, before, data);
             return 0;
         }
+        WM_MOUSEHOVER => {
+            tooltip::show(hwnd, hwnd);
+            return 0;
+        }
+        WM_MOUSELEAVE => {
+            let before = capture_visual(hwnd, data);
+            tooltip::leave(data);
+            invalidate_capture_change(hwnd, before, data);
+            return 0;
+        }
         WM_SETCURSOR if l as u32 & 0xffff == HTCLIENT => {
             let mut cursor = POINT::default();
             GetCursorPos(&mut cursor);
@@ -3139,6 +3162,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 1;
         }
         WM_LBUTTONUP => {
+            if toolbar::drag_slider(hwnd, hwnd, point(l), true) {
+                return 0;
+            }
             if data.long.is_some() {
                 return 0;
             }
@@ -3326,6 +3352,10 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_CAPTURECHANGED => {
+            if data.slider_window == hwnd {
+                data.slider_window = null_mut();
+            }
+            tooltip::hide(data);
             data.dragging = false;
             data.selecting_text = false;
             InvalidateRect(hwnd, null(), 0);
@@ -3782,6 +3812,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_NCDESTROY => {
+            if !data.tooltip_window.is_null() {
+                DestroyWindow(data.tooltip_window);
+            }
             text_editor::finish(hwnd, data, false);
             if let Some(long) = &data.long {
                 KillTimer(hwnd, 3);

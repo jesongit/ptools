@@ -9,7 +9,8 @@ pub(super) const MOSAIC_COLOR: u32 = 0x01000000;
 const ITEMS: [usize; 22] = [
     0, 1, 3, 4, 6, 7, 21, 22, 12, 25, 13, 14, 24, 15, 19, 20, 16, 10, 11, 101, 100, 9,
 ];
-const STYLE_ITEMS: [usize; 12] = [30, 31, 32, 33, 34, 35, 36, 37, 38, 40, 41, 42];
+pub(super) const SLIDER: usize = 43;
+const MAX_STROKE: i32 = 32;
 const GROUPS: [&[usize]; 3] = [&[1, 2], &[17, 18, 3], &[4, 5]];
 const GROUP_ANCHORS: [usize; 3] = [1, 3, 4];
 const MENU_DATA_TAG: usize = 0x5a00_0000;
@@ -53,38 +54,50 @@ enum ButtonHit {
 pub(super) struct Layout {
     pub bounds: RECT,
     pub buttons: Vec<(usize, RECT)>,
-    pub status: RECT,
+    pub slider: Option<RECT>,
     scale: i32,
 }
 impl Layout {
-    fn new(width: i32, height: i32, dpi: u32, anchor: Option<RECT>) -> Self {
+    fn new(width: i32, height: i32, dpi: u32, anchor: Option<RECT>, tool: Tool) -> Self {
+        let styled = !matches!(tool, Tool::Select | Tool::PickColor);
+        let color_count = if matches!(tool, Tool::Pen | Tool::Highlight) {
+            9
+        } else {
+            8
+        };
         let sizing = |scale: i32| {
             let s = |v: i32| (v * scale + 48) / 96;
-            let cell = s(38);
-            let pad = s(8);
-            let columns = ((width - pad * 2) / cell).clamp(1, ITEMS.len() as i32);
+            let cell = s(32);
+            let pad = s(6);
+            let columns = ((width - pad * 2) / cell).clamp(1, 11);
             let bar_width = columns * cell + pad * 2;
             let rows = (ITEMS.len() as i32 + columns - 1) / columns;
-            let style_columns = ((bar_width - pad * 2) / s(24)).max(1);
-            let style_rows = (STYLE_ITEMS.len() as i32 + style_columns - 1) / style_columns;
-            let bar_height = pad * 2 + rows * cell + style_rows * s(24) + s(28);
+            let color_columns = ((bar_width - pad * 2) / s(20)).max(1);
+            let inline = bar_width - pad * 2 >= s(color_count * 20 + 8 + 124);
+            let style_height = if !styled {
+                0
+            } else if inline {
+                s(28)
+            } else {
+                ((color_count + color_columns - 1) / color_columns) * s(22) + s(28)
+            };
             (
                 cell,
                 pad,
                 columns,
                 bar_width,
                 rows,
-                style_columns,
-                bar_height,
+                color_columns,
+                inline,
+                pad * 2 + rows * cell + style_height,
             )
         };
         let mut scale = dpi.max(96) as i32;
-        let (cell, pad, columns, bar_width, rows, style_columns, bar_height) = loop {
+        let (cell, pad, columns, bar_width, rows, color_columns, inline, bar_height) = loop {
             let size = sizing(scale);
-            if scale <= 96 || size.3 <= width && size.6 <= height {
+            if scale <= 96 || size.3 <= width && size.7 <= height {
                 break size;
             }
-            // Keep every action visible on a small work area at large display scales.
             scale -= 1;
         };
         let s = |v: i32| (v * scale + 48) / 96;
@@ -92,10 +105,10 @@ impl Layout {
             (r.right - bar_width).clamp(0, (width - bar_width).max(0))
         });
         let top = anchor.map_or(0, |r| {
-            if r.bottom + s(8) + bar_height <= height {
-                r.bottom + s(8)
-            } else if r.top - s(8) >= bar_height {
-                r.top - bar_height - s(8)
+            if r.bottom + s(6) + bar_height <= height {
+                r.bottom + s(6)
+            } else if r.top - s(6) >= bar_height {
+                r.top - bar_height - s(6)
             } else {
                 (height - bar_height).max(0)
             }
@@ -117,19 +130,40 @@ impl Layout {
                 )
             })
             .collect();
-        for (i, &id) in STYLE_ITEMS.iter().enumerate() {
-            let x = left + pad + i as i32 % style_columns * s(24);
-            let y = top + pad + rows * cell + i as i32 / style_columns * s(24);
-            buttons.push((
-                id,
-                RECT {
-                    left: x,
-                    top: y,
-                    right: x + s(24),
-                    bottom: y + s(24),
-                },
-            ));
-        }
+        let slider = if styled {
+            let y = top + pad + rows * cell + s(4);
+            for i in 0..color_count {
+                let x = left + pad + i % color_columns * s(20);
+                let cy = y + i / color_columns * s(22);
+                buttons.push((
+                    30 + i as usize,
+                    RECT {
+                        left: x,
+                        top: cy,
+                        right: x + s(20),
+                        bottom: cy + s(20),
+                    },
+                ));
+            }
+            let x = if inline {
+                left + pad + s(color_count * 20 + 8)
+            } else {
+                left + pad
+            };
+            let sy = if inline {
+                y
+            } else {
+                y + ((color_count + color_columns - 1) / color_columns) * s(22)
+            };
+            Some(RECT {
+                left: x,
+                top: sy,
+                right: left + bar_width - pad,
+                bottom: sy + s(20),
+            })
+        } else {
+            None
+        };
         Self {
             bounds: RECT {
                 left,
@@ -138,16 +172,31 @@ impl Layout {
                 bottom: top + bar_height,
             },
             buttons,
-            status: RECT {
-                left: left + pad,
-                top: top + bar_height - s(28),
-                right: left + bar_width - pad,
-                bottom: top + bar_height - s(4),
-            },
+            slider,
             scale,
         }
     }
+    fn rail(&self, r: RECT) -> RECT {
+        let s = |v: i32| (v * self.scale + 48) / 96;
+        RECT {
+            left: r.left + s(44),
+            right: r.right - s(6),
+            top: (r.top + r.bottom) / 2 - s(2),
+            bottom: (r.top + r.bottom) / 2 + s(2),
+        }
+    }
+    fn stroke_at(&self, x: i32) -> Option<i32> {
+        let rail = self.rail(self.slider?);
+        Some(
+            1 + ((x - rail.left).clamp(0, (rail.right - rail.left).max(1)) * (MAX_STROKE - 1)
+                + (rail.right - rail.left).max(1) / 2)
+                / (rail.right - rail.left).max(1),
+        )
+    }
     pub fn hit(&self, p: [i32; 2]) -> Option<usize> {
+        if self.slider.is_some_and(|r| contains(r, p)) {
+            return Some(SLIDER);
+        }
         self.buttons
             .iter()
             .find(|(_, r)| contains(*r, p))
@@ -155,7 +204,7 @@ impl Layout {
     }
     fn arrow_rect(&self, r: RECT) -> RECT {
         RECT {
-            left: r.right - (11 * self.scale + 48) / 96,
+            left: r.right - (9 * self.scale + 48) / 96,
             ..r
         }
     }
@@ -180,6 +229,7 @@ pub(super) unsafe fn layout(hwnd: HWND, data: &View) -> Layout {
         client.bottom,
         GetDpiForWindow(hwnd),
         data.screen.map(|_| data.selection),
+        data.tool,
     )
 }
 pub(super) fn visible(data: &View) -> bool {
@@ -190,7 +240,7 @@ pub(super) fn visible(data: &View) -> bool {
         && !data.dragging
 }
 pub(super) fn enabled(data: &View, id: usize) -> bool {
-    if data.working && matches!(id, 0..=8 | 15 | 17..=22 | 24 | 30..=42) {
+    if data.working && matches!(id, 0..=8 | 15 | 17..=22 | 24 | 30..=43) {
         return false;
     }
     match id {
@@ -266,8 +316,7 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
         let active = active_tool(data, id)
             || id == 12 && data.text_selection_enabled
             || (30..=37).contains(&id) && COLORS[id - 30] == data.color
-            || id == 38 && data.tool == Tool::Pen && data.color == MOSAIC_COLOR
-            || (40..=42).contains(&id) && [2, 3, 6][id - 40] == data.stroke;
+            || id == 38 && data.tool == Tool::Pen && data.color == MOSAIC_COLOR;
         let available = enabled(data, id);
         if active || id == 9 || data.hover_button == Some(id) && available {
             fill(
@@ -319,22 +368,7 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
         } else if id == 38 {
             mosaic_swatch(dc, r, active, layout.scale);
         } else if id == 12 {
-            text_switch(dc, r, data.text_selection_enabled, layout.scale);
-        } else if (40..=42).contains(&id) {
-            let radius = [2, 3, 5][id - 40];
-            let x = (r.left + r.right) / 2;
-            let y = (r.top + r.bottom) / 2;
-            let brush = CreateSolidBrush(color);
-            let old = SelectObject(dc, brush);
-            Ellipse(
-                dc,
-                x - s(radius),
-                y - s(radius),
-                x + s(radius),
-                y + s(radius),
-            );
-            SelectObject(dc, old);
-            DeleteObject(brush);
+            text_switch(dc, r, data.text_selection_enabled, layout.scale * 5 / 6);
         } else {
             if group_index(id).is_some() {
                 let arrow = layout.arrow_rect(r);
@@ -346,21 +380,60 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
                         ..r
                     },
                     color,
-                    layout.scale,
+                    layout.scale * 5 / 6,
                 );
                 dropdown_arrow(dc, arrow, color, layout.scale);
             } else {
-                icon(dc, id, r, color, layout.scale);
+                icon(dc, id, r, color, layout.scale * 5 / 6);
             }
         }
     }
-    let id = data.hover_button.unwrap_or_else(|| {
-        ITEMS
-            .iter()
-            .copied()
-            .find(|&id| active_tool(data, id))
-            .unwrap_or(0)
-    });
+    if let Some(r) = layout.slider {
+        let rail = layout.rail(r);
+        let x = rail.left
+            + (data.stroke.clamp(1, MAX_STROKE) - 1) * (rail.right - rail.left) / (MAX_STROKE - 1);
+        fill(dc, rail, theme::BORDER);
+        fill(dc, RECT { right: x, ..rail }, theme::ACCENT);
+        let brush = CreateSolidBrush(theme::TEXT);
+        let old = SelectObject(dc, brush);
+        let old_pen = SelectObject(dc, GetStockObject(NULL_PEN));
+        let y = (r.top + r.bottom) / 2;
+        Ellipse(dc, x - s(4), y - s(4), x + s(4) + 1, y + s(4) + 1);
+        SelectObject(dc, old_pen);
+        SelectObject(dc, old);
+        DeleteObject(brush);
+        let (_, value) = stroke_value(data);
+        let mut label = RECT {
+            right: rail.left - s(4),
+            ..r
+        };
+        SetTextColor(dc, theme::TEXT);
+        DrawTextW(
+            dc,
+            wide(&format!("{value}px")).as_ptr(),
+            -1,
+            &mut label,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+        );
+    }
+    RestoreDC(dc, saved);
+    if !font.is_null() {
+        DeleteObject(font);
+    }
+}
+fn stroke_value(data: &View) -> (&'static str, i32) {
+    match data.tool {
+        Tool::Text | Tool::Number => ("文字大小", 18 + data.stroke * 2),
+        Tool::Highlight => ("笔触宽度", data.stroke * 4),
+        Tool::Pen if data.color == MOSAIC_COLOR => ("马赛克范围", (data.stroke * 8).max(16)),
+        _ => ("线条粗细", data.stroke),
+    }
+}
+pub(super) fn hint_text(data: &View, id: usize) -> String {
+    if id == SLIDER {
+        let (name, value) = stroke_value(data);
+        return format!("{name}：{value} px · 拖动调整");
+    }
     let id = displayed_tool(data, id);
     let text = if id == 12 {
         if !data.text_selection_enabled {
@@ -392,20 +465,9 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
     } else {
         label(id)
     };
-    SetTextColor(dc, theme::MUTED);
-    let mut r = layout.status;
-    DrawTextW(
-        dc,
-        wide(text).as_ptr(),
-        -1,
-        &mut r,
-        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
-    );
-    RestoreDC(dc, saved);
-    if !font.is_null() {
-        DeleteObject(font);
-    }
+    text.to_string()
 }
+
 unsafe fn dropdown_arrow(dc: HDC, r: RECT, color: u32, dpi: i32) {
     let s = |v: i32| (v * dpi + 48) / 96;
     let x = (r.left + r.right) / 2;
@@ -841,9 +903,39 @@ pub(super) unsafe fn draw_menu(data: &View, item: &DRAWITEMSTRUCT) -> bool {
     }
     true
 }
+pub(super) unsafe fn drag_slider(owner: HWND, source: HWND, p: [i32; 2], finish: bool) -> bool {
+    let data = &mut *view(owner);
+    if data.slider_window != source {
+        return false;
+    }
+    if let Some(value) = layout(source, data).stroke_at(p[0]) {
+        data.stroke = value;
+    }
+    InvalidateRect(source, null(), 0);
+    if finish {
+        data.slider_window = null_mut();
+        ReleaseCapture();
+    }
+    true
+}
+
 pub(super) unsafe fn click(owner: HWND, source: HWND, p: [i32; 2]) -> Result<()> {
     // A native popup dispatches owner-window messages. End the View borrow before
     // entering its message loop, then reacquire it only when a tool was chosen.
+    {
+        let data = &mut *view(owner);
+        tooltip::hide(data);
+        let bar = layout(source, data);
+        if bar.slider.is_some_and(|r| contains(r, p)) {
+            if !enabled(data, SLIDER) {
+                return Ok(());
+            }
+            data.slider_window = source;
+            SetCapture(source);
+            drag_slider(owner, source, p, false);
+            return Ok(());
+        }
+    }
     let (hit, scale, button, choice, available) = {
         let ptr = view(owner);
         if ptr.is_null() {
@@ -957,6 +1049,7 @@ pub(super) unsafe fn sync_pin(owner: HWND) {
         return;
     }
     if !data.editing {
+        tooltip::hide(data);
         if !data.toolbar_window.is_null() {
             ShowWindow(data.toolbar_window, SW_HIDE);
         }
@@ -1001,6 +1094,7 @@ pub(super) unsafe fn sync_pin(owner: HWND) {
         info.rcWork.bottom - info.rcWork.top,
         GetDpiForWindow(owner),
         None,
+        data.tool,
     );
     let width = layout.bounds.right;
     let height = layout.bounds.bottom;
@@ -1066,19 +1160,33 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
                 return 0;
             }
             WM_MOUSEMOVE => {
-                data.hover_button = layout.hit(point(l));
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut track);
-                InvalidateRect(hwnd, null(), 0);
+                if drag_slider(owner, hwnd, point(l), false) {
+                    return 0;
+                }
+                let hit = layout.hit(point(l));
+                let changed = data.hover_button != hit;
+                tooltip::hover(owner, hwnd, hit);
+                if changed {
+                    InvalidateRect(hwnd, null(), 0);
+                }
+                return 0;
+            }
+            WM_LBUTTONUP => {
+                if drag_slider(owner, hwnd, point(l), true) {
+                    return 0;
+                }
+            }
+            WM_CAPTURECHANGED => {
+                if data.slider_window == hwnd {
+                    data.slider_window = null_mut();
+                }
+            }
+            WM_MOUSEHOVER => {
+                tooltip::show(owner, hwnd);
                 return 0;
             }
             WM_MOUSELEAVE => {
-                data.hover_button = None;
+                tooltip::leave(data);
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
@@ -1091,6 +1199,205 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slider_values_describe_actual_stroke_extent_and_font_size() {
+        let mut data = empty_view(RgbaImage::new(16, 16));
+        for (tool, color, value) in [
+            (Tool::Pen, COLORS[0], 3),
+            (Tool::Highlight, COLORS[2], 12),
+            (Tool::Pen, MOSAIC_COLOR, 24),
+            (Tool::Text, COLORS[0], 24),
+            (Tool::Number, COLORS[0], 24),
+        ] {
+            data.tool = tool;
+            data.color = color;
+            assert_eq!(stroke_value(&data).1, value);
+            assert!(hint_text(&data, SLIDER).contains(&format!("{value} px")));
+        }
+    }
+
+    #[test]
+    fn compact_tools_only_show_relevant_style_controls() {
+        for tool in [Tool::Select, Tool::PickColor] {
+            let bar = Layout::new(1920, 1080, 96, None, tool);
+            assert_eq!(bar.buttons.len(), 22);
+            assert!(bar.slider.is_none());
+            assert_eq!([bar.bounds.right, bar.bounds.bottom], [364, 76]);
+            assert_eq!(bar.buttons.iter().filter(|(_, r)| r.top == 6).count(), 11);
+        }
+        for tool in [
+            Tool::Rect,
+            Tool::Ellipse,
+            Tool::Line,
+            Tool::Polyline,
+            Tool::Arrow,
+            Tool::Pen,
+            Tool::Highlight,
+            Tool::Text,
+            Tool::Number,
+        ] {
+            let bar = Layout::new(1920, 1080, 96, None, tool);
+            assert!(bar.slider.is_some());
+            assert_eq!(
+                bar.buttons
+                    .iter()
+                    .filter(|(id, _)| *id >= 30 && *id <= 37)
+                    .count(),
+                8
+            );
+            assert_eq!(
+                bar.buttons.iter().any(|(id, _)| *id == 38),
+                matches!(tool, Tool::Pen | Tool::Highlight)
+            );
+            assert!(!bar.buttons.iter().any(|(id, _)| (40..=42).contains(id)));
+            assert_eq!([bar.bounds.right, bar.bounds.bottom], [364, 104]);
+        }
+    }
+
+    #[test]
+    fn stroke_slider_clamps_maps_all_values_and_fits_small_scaled_work_areas() {
+        for dpi in [96, 144, 192, 288] {
+            for width in [320, 800, 1920] {
+                let bar = Layout::new(width, 600, dpi, None, Tool::Pen);
+                let slider = bar.slider.unwrap();
+                let rail = bar.rail(slider);
+                assert!(rail.right > rail.left);
+                assert!(slider.left >= bar.bounds.left && slider.right <= bar.bounds.right);
+                assert!(slider.bottom <= bar.bounds.bottom);
+                assert_eq!(bar.stroke_at(rail.left - 500), Some(1));
+                assert_eq!(bar.stroke_at(rail.right + 500), Some(MAX_STROKE));
+                for value in 1..=MAX_STROKE {
+                    let x = rail.left
+                        + ((value - 1) * (rail.right - rail.left) + (MAX_STROKE - 1) / 2)
+                            / (MAX_STROKE - 1);
+                    assert_eq!(bar.stroke_at(x), Some(value));
+                }
+                assert_eq!(
+                    bar.hit([
+                        (slider.left + slider.right) / 2,
+                        (slider.top + slider.bottom) / 2
+                    ]),
+                    Some(SLIDER)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compact_toolbar_native_slider_and_tooltip_are_transient_and_do_not_change_old_marks() {
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let owner = pin(
+                &mut state,
+                RgbaImage::from_pixel(350, 220, Rgba([245, 245, 245, 255])),
+                None,
+                false,
+                Some([300, 300]),
+            )
+            .unwrap();
+            let data = &mut *view(owner);
+            data.editing = true;
+            sync_pin(owner);
+            let bar = data.toolbar_window;
+            let mut select_rect = RECT::default();
+            GetWindowRect(bar, &mut select_rect);
+            assert!(layout(bar, data).slider.is_none());
+            command(owner, 1).unwrap();
+            let mut draw_rect = RECT::default();
+            GetWindowRect(bar, &mut draw_rect);
+            assert!(draw_rect.bottom - draw_rect.top > select_rect.bottom - select_rect.top);
+            data.marks.push(Mark {
+                tool: Tool::Rect,
+                points: vec![[20, 20], [120, 100]],
+                text: String::new(),
+                color: COLORS[0],
+                width: 3,
+            });
+            let slider = layout(bar, data).slider.unwrap();
+            let y = (slider.top + slider.bottom) / 2;
+            let at = |x: i32, y: i32| ((x as u16 as usize) | ((y as u16 as usize) << 16)) as isize;
+            SendMessageW(
+                bar,
+                WM_LBUTTONDOWN,
+                1,
+                at((slider.left + slider.right) / 2, y),
+            );
+            assert_eq!(data.slider_window, bar);
+            SendMessageW(bar, WM_MOUSEMOVE, 1, at(-200, y));
+            assert_eq!(data.stroke, 1);
+            SendMessageW(bar, WM_MOUSEMOVE, 1, at(slider.right + 200, y));
+            assert_eq!(data.stroke, MAX_STROKE);
+            SendMessageW(bar, WM_LBUTTONUP, 0, at(slider.right, y));
+            assert!(data.slider_window.is_null());
+            assert!(!data.dragging);
+            assert_eq!(data.marks.len(), 1);
+            assert_eq!(data.marks[0].width, 3);
+            tooltip::hover(owner, bar, Some(SLIDER));
+            tooltip::show(owner, bar);
+            let hint = data.tooltip_window;
+            assert!(!hint.is_null() && IsWindowVisible(hint) != 0);
+            assert_eq!(
+                SendMessageW(hint, WM_NCHITTEST, 0, 0),
+                HTTRANSPARENT as isize
+            );
+            assert!(data.tooltip_text.contains("32 px"));
+            command(owner, 0).unwrap();
+            assert_eq!(IsWindowVisible(hint), 0);
+            assert!(layout(bar, data).slider.is_none());
+            assert_eq!(IsWindowVisible(bar), 1);
+            DestroyWindow(owner);
+            assert_eq!(IsWindow(bar), 0);
+            assert_eq!(IsWindow(hint), 0);
+            assert!(state.windows.is_empty());
+        }
+    }
+
+    #[test]
+    fn compact_toolbar_visual_evidence_for_select_pen_text_at_multiple_dpi() {
+        let Some(root) = std::env::var_os("PTOOLS_CAPTURE_EVIDENCE").map(PathBuf::from) else {
+            return;
+        };
+        fs::create_dir_all(&root).unwrap();
+        let mut data = empty_view(RgbaImage::new(16, 16));
+        for dpi in [96, 144, 192] {
+            for (name, tool) in [
+                ("select", Tool::Select),
+                ("pen", Tool::Pen),
+                ("text", Tool::Text),
+                ("mosaic", Tool::Pen),
+                ("highlight", Tool::Highlight),
+            ] {
+                data.tool = tool;
+                data.color = if name == "mosaic" {
+                    MOSAIC_COLOR
+                } else {
+                    COLORS[0]
+                };
+                data.stroke = if matches!(name, "mosaic" | "highlight") {
+                    32
+                } else {
+                    3
+                };
+                let bar = Layout::new(1920, 1080, dpi, None, tool);
+                let mut image = RgbaImage::new(bar.bounds.right as u32, bar.bounds.bottom as u32);
+                unsafe {
+                    paint_native(&mut image, |dc| draw(dc, &data, &bar));
+                }
+                image
+                    .save(root.join(format!("compact-{name}-{dpi}.png")))
+                    .unwrap();
+            }
+        }
+    }
+
     #[test]
     fn toolbar_layout_keeps_buttons_and_hit_targets_inside_at_multiple_dpi() {
         for dpi in [96, 144, 192, 288] {
@@ -1105,6 +1412,7 @@ mod tests {
                         right: 200,
                         bottom: 1070,
                     }),
+                    Tool::Pen,
                 );
                 assert!(layout.bounds.left >= 0 && layout.bounds.top >= 0);
                 assert!(layout.bounds.right <= width);
@@ -1112,7 +1420,7 @@ mod tests {
                 for &(id, r) in &layout.buttons {
                     assert!(r.right <= layout.bounds.right && r.bottom <= layout.bounds.bottom);
                     assert!(r.left >= layout.bounds.left && r.top >= layout.bounds.top);
-                    assert!(r.bottom <= layout.status.top);
+                    assert!(r.bottom <= layout.bounds.bottom);
                     assert_eq!(
                         layout.hit([(r.left + r.right) / 2, (r.top + r.bottom) / 2]),
                         Some(id)
@@ -1124,7 +1432,7 @@ mod tests {
 
     #[test]
     fn toolbar_exposes_recognition_and_screen_actions_without_a_more_menu() {
-        let layout = Layout::new(800, 600, 144, None);
+        let layout = Layout::new(800, 600, 144, None, Tool::Pen);
         let ids: Vec<_> = layout.buttons.iter().map(|&(id, _)| id).collect();
         for id in [12, 13, 14, 15, 16, 19, 20, 24, 25, 38, 101] {
             assert!(ids.contains(&id), "missing action {id}");
@@ -1144,7 +1452,7 @@ mod tests {
         let choices = [2, 18, 5];
         for dpi in [96, 144, 192, 288] {
             for (width, height) in [(320, 600), (800, 1080), (1920, 1080)] {
-                let layout = Layout::new(width, height, dpi, None);
+                let layout = Layout::new(width, height, dpi, None, Tool::Pen);
                 for (group, &anchor) in GROUP_ANCHORS.iter().enumerate() {
                     let button = layout
                         .buttons
@@ -1198,7 +1506,7 @@ mod tests {
 
     #[test]
     fn grouped_choices_fall_back_to_valid_defaults_and_remove_duplicate_cells() {
-        let layout = Layout::new(1920, 1080, 96, None);
+        let layout = Layout::new(1920, 1080, 96, None, Tool::Select);
         let ids: Vec<_> = layout
             .buttons
             .iter()
@@ -1242,8 +1550,14 @@ mod tests {
     #[test]
     fn toolbar_pin_window_keeps_the_same_size_when_using_its_client_bounds() {
         for (width, height, dpi) in [(320, 600, 192), (800, 600, 288), (1920, 1080, 192)] {
-            let screen = Layout::new(width, height, dpi, None);
-            let window = Layout::new(screen.bounds.right, screen.bounds.bottom, dpi, None);
+            let screen = Layout::new(width, height, dpi, None, Tool::Pen);
+            let window = Layout::new(
+                screen.bounds.right,
+                screen.bounds.bottom,
+                dpi,
+                None,
+                Tool::Pen,
+            );
             assert_eq!(screen.bounds.right, window.bounds.right);
             assert_eq!(screen.bounds.bottom, window.bounds.bottom);
             assert_eq!(screen.scale, window.scale);
@@ -1252,7 +1566,7 @@ mod tests {
 
     #[test]
     fn original_file_action_is_visible_and_only_enabled_for_file_backed_images() {
-        let layout = Layout::new(320, 600, 288, None);
+        let layout = Layout::new(320, 600, 288, None, Tool::Select);
         let mut data = empty_view(RgbaImage::new(32, 32));
         let button = layout.buttons.iter().find(|&&(id, _)| id == 101).unwrap().1;
         assert_eq!(

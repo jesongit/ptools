@@ -290,11 +290,11 @@ function Toolbar-Geometry {
     $r=Client-Rect $script:toolbar
     $scale=[Math]::Max(96,[int][CaptureGroupsWin]::GetDpiForWindow($script:toolbar))
     while($true) {
-        $cell=[int][Math]::Floor((38*$scale+48)/96); $pad=[int][Math]::Floor((8*$scale+48)/96)
-        $columns=[Math]::Min($toolbarItems.Count,[Math]::Max(1,[int][Math]::Floor(($r.Right-2*$pad)/$cell)))
-        $style=[int][Math]::Floor((24*$scale+48)/96); $width=$columns*$cell+2*$pad
+        $cell=[int][Math]::Floor((32*$scale+48)/96); $pad=[int][Math]::Floor((6*$scale+48)/96)
+        $columns=[Math]::Min(11,[Math]::Max(1,[int][Math]::Floor(($r.Right-2*$pad)/$cell)))
+        $style=[int][Math]::Floor((20*$scale+48)/96); $width=$columns*$cell+2*$pad
         $rows=[int][Math]::Ceiling($toolbarItems.Count/$columns); $styleColumns=[Math]::Max(1,[int][Math]::Floor(($width-2*$pad)/$style))
-        $height=2*$pad+$rows*$cell+[int][Math]::Ceiling(12/$styleColumns)*$style+[int][Math]::Floor((28*$scale+48)/96)
+        $height=if($script:toolbarAnchor) {2*$pad+$rows*$cell+[int][Math]::Floor((28*$scale+48)/96)} else {$r.Bottom}
         if($scale -le 96 -or ($width -le $r.Right -and $height -le $r.Bottom)) { break }; $scale--
     }
     $left=0; $top=0
@@ -308,7 +308,7 @@ function Toolbar-Geometry {
 }
 function Toolbar-Click([int]$Id) {
     $g=Toolbar-Geometry
-    if($Id -eq 38) { $x=$g.pad+(8%$g.style_columns)*$g.style+[int]($g.style/2); $y=$g.pad+$g.rows*$g.cell+[int][Math]::Floor(8/$g.style_columns)*$g.style+[int]($g.style/2) }
+    if($Id -eq 38) { $x=$g.pad+(8%$g.style_columns)*$g.style+[int]($g.style/2); $y=$g.pad+$g.rows*$g.cell+[int][Math]::Floor((4*$g.scale+48)/96)+[int][Math]::Floor(8/$g.style_columns)*[int][Math]::Floor((22*$g.scale+48)/96)+[int]($g.style/2) }
     else {
         $i=[Array]::IndexOf($toolbarItems,$Id)
         if($i -lt 0) { throw "Unknown toolbar item $Id" }
@@ -568,6 +568,34 @@ try {
     $g=Toolbar-Geometry
     Check ($g.width -le (Client-Rect $toolbar).Right -and $g.height -le (Client-Rect $toolbar).Bottom) 'Floating toolbar geometry fits every main and style action'
     Check ((Toolbar-Fill 'pin-toolbar-initial.png' 12) -eq (Toolbar-Fill 'pin-toolbar-initial.png' 1)) 'OCR switch remains independently highlighted with the initial shape tool'
+    [void][CaptureGroupsWin]::Send($pin,0x0111,0)
+    $compact=Client-Rect $toolbar; $g=Toolbar-Geometry
+    Check ($g.columns -eq 11 -and $g.rows -eq 2) 'Compact pin toolbar keeps all 22 actions in two short rows'
+    Check ($compact.Bottom -eq 2*$g.pad+2*$g.cell) 'Move tool hides color palette, width slider and the former status row'
+    Snapshot $toolbar 'pin-toolbar-select-compact.png'
+    [void][CaptureGroupsWin]::Send($pin,0x0111,4)
+    $g=Toolbar-Geometry; $styled=Client-Rect $toolbar
+    Check ($styled.Bottom -gt $compact.Bottom) 'Brush tool reveals its contextual color palette and slider'
+    $scaled={param($v) [int][Math]::Floor(($v*$g.scale+48)/96)}
+    $sliderLeft=$g.left+$g.pad+9*$g.style+(& $scaled 8)
+    $railLeft=$sliderLeft+(& $scaled 44);$railRight=$g.left+$g.width-$g.pad-(& $scaled 6)
+    $sliderY=$g.top+$g.pad+$g.rows*$g.cell+(& $scaled 14)
+    Mouse-Point $toolbar 0x0201 ([int](($railLeft+$railRight)/2)) $sliderY 1
+    Mouse-Point $toolbar 0x0200 ($railRight+300) $sliderY 1
+    Mouse-Point $toolbar 0x0202 $railRight $sliderY
+    Snapshot $toolbar 'pin-toolbar-slider-max.png'
+    $toolbarBounds=Window-Rect $toolbar
+    [void][CaptureGroupsWin]::SetCursorPos(($toolbarBounds.Left+[int](($railLeft+$railRight)/2)),($toolbarBounds.Top+$sliderY))
+    Mouse-Point $toolbar 0x0200 ([int](($railLeft+$railRight)/2)) $sliderY
+    Wait-For { $script:hint=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.tooltip'))[0]; $null -ne $hint } 'cursor tooltip after slider hover'
+    Check (([CaptureGroupsWin]::Describe($hint)) -like '*32 px*') 'Dragging beyond the width rail clamps at 32 pixels and updates the floating hint'
+    Check ([CaptureGroupsWin]::Send($hint,0x0084) -eq -1) 'Cursor hint passes mouse hit testing through to the underlying window'
+    Snapshot $hint 'pin-toolbar-width-tooltip.png'
+    if($originalCursor) { [void][CaptureGroupsWin]::SetCursorPos($originalCursor.X,$originalCursor.Y) }
+    [void][CaptureGroupsWin]::Send($toolbar,0x02A3)
+    Check (-not [CaptureGroupsWin]::IsWindowVisible($hint)) 'Leaving the toolbar hides its cursor hint'
+    [void][CaptureGroupsWin]::Send($pin,0x0111,41)
+    [void][CaptureGroupsWin]::Send($pin,0x0111,1)
     if($originalForeground -ne [IntPtr]::Zero -and [CaptureGroupsWin]::IsWindow($originalForeground)) {
         if(-not [CaptureGroupsWin]::Focus($originalForeground)) { throw 'Cannot restore original app foreground for the nonactivating toolbar check' }
         Check ([CaptureGroupsWin]::GetForegroundWindow() -eq [CaptureGroupsWin]::GetAncestor($originalForeground,2)) 'The original external app is foreground before the floating toolbar dropdown opens'
@@ -619,6 +647,7 @@ try {
     Copy-PinImage 'pin-after-outside-cancel.png'
     Check ((Changed-Pixels 'pin-before-outside-cancel.png' 'pin-after-outside-cancel.png' @(0,0,960,420)) -eq 0) 'Outside menu click is consumed without drawing on the underlying pin'
     $rows=@(Group-Open $groups[0] 'pin-after-outside-cancel'); Group-Checked $rows 2 'Outside cancellation preserves the remembered ellipse choice'; Menu-Cancel
+    Shortcut 0x50
     Toolbar-Click 38; Snapshot $toolbar 'pin-mosaic-toolbar.png'
     Check ((Toolbar-Fill 'pin-mosaic-toolbar.png' 12) -eq (Toolbar-Fill 'pin-mosaic-toolbar.png' 4)) 'Mosaic stays in the style palette while its brush group and the OCR switch remain highlighted'
 

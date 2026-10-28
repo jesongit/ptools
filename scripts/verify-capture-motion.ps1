@@ -1,4 +1,4 @@
-param([string]$Executable='', [string]$BaselineExecutable='', [switch]$Daily)
+param([string]$Executable='', [string]$BaselineExecutable='', [switch]$Daily, [switch]$CheckToolbar)
 $ErrorActionPreference='Stop'
 $projectRoot=Split-Path -Parent $PSScriptRoot
 if($Daily) { $Executable=Join-Path $projectRoot 'run/data/plugins/capture/ptools-capture.exe'; if($BaselineExecutable) {throw 'Daily mode cannot run a baseline instance'} }
@@ -28,10 +28,18 @@ public static class CaptureMotionWin {
   [DllImport("gdi32.dll")] static extern bool GdiFlush();
   [DllImport("dwmapi.dll")] static extern int DwmFlush();
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left,Top,Right,Bottom; }
-  public static IntPtr Window(uint process) {
+  [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr h);
+  [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr h,IntPtr dc);
+  [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc,int x,int y);
+  [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] static extern bool SetCursorPos(int x,int y);
+  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h,StringBuilder value,int max);
+  [StructLayout(LayoutKind.Sequential)] struct POINT {public int X,Y;}
+  public static IntPtr Window(uint process,string match="ptools.capture.view") {
     IntPtr result=IntPtr.Zero;
     EnumWindows((h,l)=>{ GetWindowThreadProcessId(h,out uint pid);var name=new StringBuilder(256);GetClassName(h,name,256);
-      if(pid==process && name.ToString()=="ptools.capture.view" && IsWindowVisible(h)) result=h;return true;},IntPtr.Zero);
+      if(pid==process && name.ToString()==match && IsWindowVisible(h)) result=h;return true;},IntPtr.Zero);
     return result;
   }
   static void Send(IntPtr h,uint msg,int x,int y,int flags=0) {
@@ -54,6 +62,35 @@ public static class CaptureMotionWin {
       release[1]=new INPUT{Type=1,Data=new UNION{Key=new KEY{Vk=0x11,Flags=2}}};
       SendInput(2,release,Marshal.SizeOf<INPUT>());throw new Exception("Capture hotkey injection failed");
     }
+  }
+  public static string VerifyToolbar(IntPtr h,uint process,int selectionBottom) {
+    int dpi=(int)GetDpiForWindow(h);Func<int,int> s=v=>(v*dpi+48)/96;
+    GetWindowRect(h,out RECT bounds);GetCursorPos(out POINT cursor);
+    int width=s(32)*11+s(6)*2;
+    int left=Math.Max(0,1328-width), top=selectionBottom+s(6);
+    if(top+s(104)>bounds.Bottom-bounds.Top) top=200-s(104)-s(6);
+    IntPtr dc=IntPtr.Zero;
+    try {
+      if(SendRaw(h,0x111,new IntPtr(4),IntPtr.Zero,2,5000,out UIntPtr result)==IntPtr.Zero) throw new Exception("Cannot select brush");
+      UpdateWindow(h);dc=GetDC(h);
+      int colorX=left+s(6)+s(10), colorY=top+s(6)+2*s(32)+s(14);
+      if(GetPixel(dc,colorX,colorY)!=0x0048e8) throw new Exception("Daily brush palette did not render at its compact contextual row");
+      int sliderLeft=left+s(6)+9*s(20)+s(8), railLeft=sliderLeft+s(44), railRight=left+width-s(6)-s(6);
+      Send(h,0x201,(railLeft+railRight)/2,colorY,1);
+      Send(h,0x200,railRight+200,colorY,1);Send(h,0x202,railRight,colorY);
+      SetCursorPos(bounds.Left+(railLeft+railRight)/2,bounds.Top+colorY);
+      Send(h,0x200,(railLeft+railRight)/2,colorY);
+      IntPtr hint=IntPtr.Zero;var timer=Stopwatch.StartNew();
+      while(hint==IntPtr.Zero && timer.ElapsedMilliseconds<3000) {System.Threading.Thread.Sleep(50);hint=Window(process,"ptools.capture.tooltip");}
+      if(hint==IntPtr.Zero) throw new Exception("Daily cursor hint did not appear");
+      var label=new StringBuilder(4096);GetWindowText(hint,label,4096);
+      if(!label.ToString().Contains("32 px")) throw new Exception("Daily slider did not clamp at 32 px");
+      if(SendRaw(h,0x111,IntPtr.Zero,IntPtr.Zero,2,5000,out result)==IntPtr.Zero) throw new Exception("Cannot select move tool");
+      UpdateWindow(h);
+      if(IsWindowVisible(hint)) throw new Exception("Daily hint survived the tool switch");
+      if(GetPixel(dc,colorX,colorY)==0x0048e8) throw new Exception("Move tool still renders the color palette");
+      return "passed: daily brush palette, captured slider drag/clamp, cursor hint and move-tool hiding";
+    } finally {if(dc!=IntPtr.Zero) ReleaseDC(h,dc);SetCursorPos(cursor.X,cursor.Y);}
   }
   public static double[][] Measure(IntPtr h) {
     var paint=new List<double>();var composed=new List<double>();
@@ -104,7 +141,19 @@ try {
             $r=[CaptureMotionWin+RECT]::new();[void][CaptureMotionWin]::GetWindowRect($window,[ref]$r)
             Start-Sleep -Milliseconds 150
             $samples=[CaptureMotionWin]::Measure($window)
-            $reports+=@{label=$candidate.label;daily=[bool]$Daily;executable=$resolved;sha256=(Get-FileHash -LiteralPath $resolved).Hash;
+            $toolbarResult='not requested'
+            if($CheckToolbar) {
+                $selectionBottom=864
+                if($Daily) {
+                    $captureSettingsPath=Join-Path $projectRoot 'run/data/plugin-data/capture/settings.json'
+                    if(Test-Path -LiteralPath $captureSettingsPath) {
+                        $captureSettings=Get-Content -LiteralPath $captureSettingsPath -Raw | ConvertFrom-Json
+                        if($captureSettings.fixed_ratio) { $selectionBottom=[Math]::Min($r.Bottom-$r.Top,200+[int][Math]::Floor(1128*$captureSettings.fixed_ratio[1]/$captureSettings.fixed_ratio[0])) }
+                    }
+                }
+                $toolbarResult=[CaptureMotionWin]::VerifyToolbar($window,$process.Id,$selectionBottom)
+            }
+            $reports+=@{label=$candidate.label;daily=[bool]$Daily;toolbar=$toolbarResult;executable=$resolved;sha256=(Get-FileHash -LiteralPath $resolved).Hash;
                 size=@(($r.Right-$r.Left),($r.Bottom-$r.Top));frames=$samples[0].Length;
                 paintMedianMs=$samples[0][20];paintP95Ms=$samples[0][38];composedMedianMs=$samples[1][20];composedP95Ms=$samples[1][38]}
         } finally {
@@ -117,7 +166,7 @@ try {
 } finally {
     if($originalForeground -ne [IntPtr]::Zero -and [CaptureMotionWin]::IsWindow($originalForeground)) {[void][CaptureMotionWin]::SetForegroundWindow($originalForeground)}
     [void][CaptureMotionWin]::SetThreadDpiAwarenessContext($originalDpi)
-    @{status=if($completed){'measured'}else{'failed'};input='native mouse messages into visible isolated capture windows; UpdateWindow, GdiFlush, DwmFlush';limits='Does not inject physical mouse movement or measure hardware-to-display latency';reports=$reports} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'results.json')
+    @{status=if($completed){'measured'}else{'failed'};input='daily Ctrl+1 uses SendInput; native mouse messages, UpdateWindow, GdiFlush, DwmFlush; optional live contextual toolbar checks';limits='Software event and compositor timings; hardware sensor and display response are not measured';reports=$reports} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $runRoot 'results.json')
     Write-Output "Evidence: $runRoot"
 }
 $reports | ConvertTo-Json -Depth 5

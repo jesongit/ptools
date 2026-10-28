@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "ptools"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "ptools-core",
  "ptools-ui",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "ptools-applications"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "ptools-core",
  "serde_json",
@@ -595,7 +595,7 @@ dependencies = [
 
 [[package]]
 name = "ptools-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "pinyin",
  "serde",
@@ -606,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "ptools-tools"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "image",
  "ptools-core",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "ptools-ui"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "windows-sys",
 ]
