@@ -2,6 +2,7 @@
 /dist/
 /artifacts/
 /data/
+/run/
 *.tmp
 prompt.md
 /assets/icon-concepts/

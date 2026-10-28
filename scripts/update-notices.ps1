@@ -4,7 +4,8 @@ $metadata=cargo metadata --format-version 1 --locked --filter-platform x86_64-pc
 if($LASTEXITCODE -ne 0) { throw 'Dependency metadata failed' }
 $resolved=@{}; foreach($node in $metadata.resolve.nodes) { $resolved[$node.id]=$true }
 $lines=[Collections.Generic.List[string]]::new()
-$lines.Add('ptools v0.1.0 - third-party notices')
+$releaseVersion=($metadata.packages | Where-Object name -eq 'ptools').version
+$lines.Add("ptools v$releaseVersion - third-party notices")
 $lines.Add('License texts from the locked Windows x64 GNU dependencies, including build dependencies.')
 foreach($package in ($metadata.packages | Where-Object { $_.source -and $resolved.ContainsKey($_.id) } | Sort-Object name,version)) {
     $directory=Split-Path -Parent $package.manifest_path

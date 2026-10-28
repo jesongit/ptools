@@ -95,6 +95,9 @@ pub struct Settings {
     pub usage: BTreeMap<String, Usage>,
     #[serde(default)]
     pub plugin_hotkeys: BTreeMap<String, String>,
+    pub auto_update_check: bool,
+    pub update_lan_api: String,
+    pub update_github_api: String,
 }
 
 impl Default for Settings {
@@ -104,6 +107,11 @@ impl Default for Settings {
             disabled_plugins: BTreeSet::new(),
             usage: BTreeMap::new(),
             plugin_hotkeys: BTreeMap::new(),
+            auto_update_check: true,
+            update_lan_api: "http://192.168.31.10:13000/api/v1/repos/posase/ptools/releases/latest"
+                .into(),
+            update_github_api: "https://api.github.com/repos/jesongit/ptools/releases/latest"
+                .into(),
         }
     }
 }

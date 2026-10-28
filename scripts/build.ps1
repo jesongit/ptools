@@ -47,6 +47,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/native-tools.md') -Destination $packageRoot -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/windows-launcher.md') -Destination $packageRoot -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/quick-input.md') -Destination $packageRoot -Force
+    Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/updating.md') -Destination $packageRoot -Force
     Copy-Item -LiteralPath (Join-Path $projectRoot 'docs/ui-style-guide.md') -Destination $packageRoot -Force
     $verification=Join-Path $projectRoot 'docs/verification.md'
     if(Test-Path -LiteralPath $verification) { Copy-Item -LiteralPath $verification -Destination $packageRoot -Force }
@@ -54,6 +55,7 @@ try {
     # Explicit input paths keep user-created portable data out of distribution archives.
     $packageFiles=@((Join-Path $packageRoot 'ptools.exe'), (Join-Path $packageRoot 'plugins'), (Join-Path $packageRoot 'README.md'), (Join-Path $packageRoot 'plugin-development.md'), (Join-Path $packageRoot 'native-tools.md'), (Join-Path $packageRoot 'windows-launcher.md'), (Join-Path $packageRoot 'quick-input.md'), (Join-Path $packageRoot 'ui-style-guide.md'), (Join-Path $packageRoot 'LICENSE'), (Join-Path $packageRoot 'THIRD_PARTY_NOTICES.txt'))
     if(Test-Path -LiteralPath $verification) { $packageFiles+=(Join-Path $packageRoot 'verification.md') }
+    $packageFiles+=(Join-Path $packageRoot 'updating.md')
     Compress-Archive -Path $packageFiles -DestinationPath $archive -Force
     $pluginArchive = Join-Path $distributionRoot 'applications.zip'
     Compress-Archive -Path (Join-Path $pluginRoot '*') -DestinationPath $pluginArchive -Force

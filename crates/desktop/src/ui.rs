@@ -41,6 +41,7 @@ const COPY_ID: usize = 204;
 const OUTPUT_ID: usize = 205;
 const OUTPUT_STATUS_ID: usize = 206;
 const TIMER_SMOKE: usize = 301;
+const TIMER_UPDATE: usize = 302;
 const MAX_ICONS: usize = 64;
 // winresource::set_icon embeds the application icon with resource ID 1.
 const APPLICATION_ICON_ID: usize = 1;
@@ -95,6 +96,8 @@ enum Action {
     OpenLog,
     ResetHistory,
     Autostart,
+    Update,
+    ToggleUpdateCheck,
     Exit,
 }
 #[derive(Clone)]
@@ -110,6 +113,8 @@ enum Event {
     Installed(Result<Manifest>),
     Uninstalled(String, Result<()>),
     CommandFinished(u64, Result<crate::command::CommandResult>),
+    UpdateChecked(Result<crate::updater::Check>),
+    UpdatePrepared(Result<crate::updater::Prepared>),
 }
 
 struct ResultPanel {
@@ -135,6 +140,9 @@ struct State {
     mode_exit_delete: Option<usize>,
     status: String,
     busy: bool,
+    update_busy: bool,
+    update_candidate: Option<crate::updater::Candidate>,
+    update_message: String,
     dialog: bool,
     suppress_edit: bool,
     composing: bool,
@@ -282,6 +290,9 @@ pub fn run(
                 format!("{} 个插件加载失败，输入“设置”查看日志", errors.len())
             },
             busy: false,
+            update_busy: false,
+            update_candidate: None,
+            update_message: "内网优先，连接失败时使用 GitHub".into(),
             dialog: false,
             suppress_edit: false,
             composing: false,
@@ -369,6 +380,10 @@ pub fn run(
             show(hwnd);
         }
         start_refresh(hwnd);
+        if !smoke {
+            start_update_check(hwnd, false);
+            SetTimer(hwnd, TIMER_UPDATE, 24 * 60 * 60 * 1000, None);
+        }
         if smoke {
             SetTimer(hwnd, TIMER_SMOKE, 5000, None);
         }
@@ -906,6 +921,7 @@ unsafe fn rebuild(hwnd: HWND) {
                 }
             }
             for (keywords, row) in [
+                ("更新 update gengxin gx", update_row(s)),
                 (
                     "插件 plugins chajian cj",
                     command(
@@ -950,6 +966,9 @@ unsafe fn rebuild(hwnd: HWND) {
                     rows.insert(0, row);
                 }
             }
+            if query.is_empty() && (*s).update_candidate.is_some() {
+                rows.insert(0, update_row(s));
+            }
         }
         Page::Menu => {
             for row in [
@@ -957,6 +976,7 @@ unsafe fn rebuild(hwnd: HWND) {
                 command("刷新应用索引", "重新发现已安装的应用", "↻", Action::Refresh),
                 command("插件管理", "安装与管理你的本地插件", "+", Action::Plugins),
                 command("设置", "快捷键、开机启动和数据目录", "⚙", Action::Settings),
+                update_row(s),
                 command("退出 ptools", "结束程序并释放快捷键", "×", Action::Exit),
             ] {
                 if query.is_empty() || row.title.to_lowercase().contains(&query) {
@@ -1024,6 +1044,21 @@ unsafe fn rebuild(hwnd: HWND) {
             ));
         }
         Page::Settings => {
+            rows.push(update_row(s));
+            rows.push(command(
+                if (*s).settings.auto_update_check {
+                    "自动检查更新：已开启"
+                } else {
+                    "自动检查更新：已关闭"
+                },
+                "启动时及每 24 小时检查；安装前由你点击更新",
+                if (*s).settings.auto_update_check {
+                    "开启"
+                } else {
+                    "关闭"
+                },
+                Action::ToggleUpdateCheck,
+            ));
             for hotkey in ["Alt+Space", "Ctrl+Alt+Space", "Ctrl+Space"] {
                 let current = (*s).settings.hotkey == hotkey;
                 rows.push(command(
@@ -1324,9 +1359,93 @@ unsafe fn start_command(hwnd: HWND) {
     rebuild(hwnd);
 }
 
+unsafe fn update_row(s: *mut State) -> Row {
+    let title = if (*s).update_busy {
+        "正在处理更新…".into()
+    } else if let Some(candidate) = &(*s).update_candidate {
+        format!("更新到 {}", candidate.version)
+    } else {
+        "检查更新".into()
+    };
+    command(
+        &title,
+        &format!(
+            "当前 {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            (*s).update_message
+        ),
+        if (*s).update_busy {
+            "请稍候"
+        } else {
+            "更新"
+        },
+        Action::Update,
+    )
+}
+
+unsafe fn start_update_check(hwnd: HWND, manual: bool) {
+    let s = state(hwnd);
+    if (*s).update_busy || (!manual && !(*s).settings.auto_update_check) {
+        return;
+    }
+    (*s).update_busy = true;
+    (*s).update_message = "正在检查：内网优先，GitHub 备用…".into();
+    let settings = (*s).settings.clone();
+    let tx = (*s).tx.clone();
+    let window = hwnd as usize;
+    std::thread::spawn(move || {
+        let result = crate::updater::check(&settings, env!("CARGO_PKG_VERSION"));
+        let _ = tx.send(Event::UpdateChecked(result));
+        PostMessageW(window as HWND, WM_WORK, 0, 0);
+    });
+    rebuild(hwnd);
+}
+
 unsafe fn act(hwnd: HWND, action: Action) {
     let s = state(hwnd);
     match action {
+        Action::Update => {
+            if (*s).update_busy {
+                return;
+            }
+            if let Some(candidate) = (*s).update_candidate.clone() {
+                if (*s).busy || (*s).command_running {
+                    alert(hwnd, "请等待当前任务完成后再更新。", false);
+                    return;
+                }
+                if !alert(
+                    hwnd,
+                    &format!(
+                        "更新到 {}？\n\n下载并校验完整软件包后，ptools 将关闭截图和贴图窗口并重新启动。配置和历史会保留。",
+                        candidate.version
+                    ),
+                    true,
+                ) {
+                    return;
+                }
+                (*s).update_busy = true;
+                (*s).update_message = "正在下载并校验，完成后自动重启…".into();
+                let paths = (*s).paths.clone();
+                let settings = (*s).settings.clone();
+                let tx = (*s).tx.clone();
+                let window = hwnd as usize;
+                std::thread::spawn(move || {
+                    let result = crate::updater::prepare(&candidate, &paths, &settings);
+                    let _ = tx.send(Event::UpdatePrepared(result));
+                    PostMessageW(window as HWND, WM_WORK, 0, 0);
+                });
+                rebuild(hwnd);
+            } else {
+                start_update_check(hwnd, true);
+            }
+        }
+        Action::ToggleUpdateCheck => {
+            (*s).settings.auto_update_check = !(*s).settings.auto_update_check;
+            if !save_settings(hwnd) {
+                (*s).settings.auto_update_check = !(*s).settings.auto_update_check;
+            }
+            rebuild(hwnd);
+        }
         Action::Launch(item) => {
             if let Target::Plugin { action } = &item.entry.target {
                 hide(hwnd, false);
@@ -1582,10 +1701,42 @@ unsafe fn handle_events(hwnd: HWND) {
     let s = state(hwnd);
     let events: Vec<_> = (*s).rx.try_iter().collect();
     for event in events {
-        if !matches!(&event, Event::Icon(_, _) | Event::CommandFinished(_, _)) {
+        if matches!(
+            &event,
+            Event::Refreshed(_, _) | Event::Installed(_) | Event::Uninstalled(_, _)
+        ) {
             (*s).busy = false;
         }
         match event {
+            Event::UpdateChecked(result) => {
+                (*s).update_busy = false;
+                match result {
+                    Ok(check) => {
+                        (*s).update_candidate = check.update;
+                        (*s).update_message = check.message;
+                    }
+                    Err(error) => {
+                        (*s).update_message = format!("检查失败：{error}；点击重试");
+                    }
+                }
+                rebuild(hwnd);
+            }
+            Event::UpdatePrepared(result) => {
+                let result = result.and_then(|prepared| prepared.launch());
+                match result {
+                    Ok(()) => {
+                        DestroyWindow(hwnd);
+                        return;
+                    }
+                    Err(error) => {
+                        (*s).update_busy = false;
+                        (*s).update_message = "更新失败，点击重试".into();
+                        let _ = std::fs::write((*s).paths.root.join("last-update.txt"), &error);
+                        alert(hwnd, &error, false);
+                        rebuild(hwnd);
+                    }
+                }
+            }
             Event::CommandFinished(request, result) => {
                 if request == (*s).command_id {
                     (*s).command_running = false;
@@ -2054,6 +2205,17 @@ unsafe fn tray_menu(hwnd: HWND) {
         2,
         wide("自启动").as_ptr(),
     );
+    let update = update_row(s);
+    AppendMenuW(
+        popup,
+        if (*s).update_busy {
+            MF_STRING | MF_GRAYED
+        } else {
+            MF_STRING
+        },
+        3,
+        wide(&update.title).as_ptr(),
+    );
     AppendMenuW(popup, MF_STRING, 1, wide("关闭").as_ptr());
     let mut point: POINT = zeroed();
     GetCursorPos(&mut point);
@@ -2075,6 +2237,11 @@ unsafe fn tray_menu(hwnd: HWND) {
     match selected {
         1 => act(hwnd, Action::Exit),
         2 => act(hwnd, Action::Autostart),
+        3 => {
+            navigate(hwnd, Page::Settings);
+            show(hwnd);
+            act(hwnd, Action::Update);
+        }
         _ => {}
     }
 }
@@ -2738,6 +2905,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
             layout(hwnd);
+            return 0;
+        }
+        WM_TIMER if w == TIMER_UPDATE => {
+            start_update_check(hwnd, false);
             return 0;
         }
         WM_TIMER if w == TIMER_SMOKE => {
