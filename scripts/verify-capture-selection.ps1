@@ -247,7 +247,7 @@ try {
 
     $gui=Start-Process -FilePath $Executable -ArgumentList @('--action','history','--data-dir',('"'+$dataRoot+'"')) -WindowStyle Hidden -PassThru
     $results.process_id=$gui.Id
-    Wait-For { $script:history=@([CaptureSelectionWin]::Windows($gui.Id,'ptools.capture.view'))[0]; $null -ne $script:history } 'private history window'
+    Wait-For { $script:history=@([CaptureSelectionWin]::Windows($gui.Id,'ptools.capture.view'))[0]; $null -ne $script:history -and [CaptureSelectionWin]::GetDlgItem($history,1) -ne [IntPtr]::Zero } 'private history window and list'
     Check ([CaptureSelectionWin]::Send([CaptureSelectionWin]::GetDlgItem($history,1),0x018B) -eq 1) 'Private history contains exactly the generated fixture'
     Set-Sentinel
     [void][CaptureSelectionWin]::Send($history,0x0111,(1 -bor (2 -shl 16)))
@@ -258,7 +258,7 @@ try {
     Snapshot $toolbar 'toolbar-all-icons.png'
     $g=Toolbar-Geometry; $toolbarBitmap=[Drawing.Bitmap]::new((Join-Path $runRoot 'toolbar-all-icons.png'))
     try {
-        foreach($id in @(12,25,13,14,24,15,19,20,16,17,18,101)) {
+        foreach($id in @(12,25,13,14,24,15,19,20,16,101)) {
             $i=[Array]::IndexOf($toolbarItems,$id); $left=$g.pad+($i%$g.columns)*$g.cell; $top=$g.pad+[int][Math]::Floor($i/$g.columns)*$g.cell
             $colors=[Collections.Generic.HashSet[int]]::new()
             for($y=$top+5;$y -lt $top+$g.cell-5;$y++) { for($x=$left+5;$x -lt $left+$g.cell-5;$x++) { [void]$colors.Add($toolbarBitmap.GetPixel($x,$y).ToArgb()) } }

@@ -129,6 +129,7 @@ struct View {
     detect_at: Instant,
     detector: Option<Detector>,
     background: Option<PaintSurface>,
+    shaded_background: Option<PaintSurface>,
     backbuffer: Option<PaintSurface>,
     font: HFONT,
     alpha: u8,
@@ -211,6 +212,170 @@ impl Drop for PaintSurface {
     }
 }
 
+struct PaintRegion(HRGN);
+impl PaintRegion {
+    unsafe fn rectangle(r: RECT) -> Option<Self> {
+        let region = CreateRectRgn(r.left, r.top, r.right, r.bottom);
+        (!region.is_null()).then_some(Self(region))
+    }
+    unsafe fn window_update(hwnd: HWND) -> Option<Self> {
+        let region = Self::rectangle(RECT::default())?;
+        (GetUpdateRgn(hwnd, region.0, 0) != 0).then_some(region)
+    }
+    unsafe fn add_rect(&self, r: RECT) {
+        if let Some(other) = Self::rectangle(r) {
+            CombineRgn(self.0, self.0, other.0, RGN_OR);
+        }
+    }
+    unsafe fn add_frame(&self, r: RECT) {
+        if r.right <= r.left || r.bottom <= r.top {
+            return;
+        }
+        for edge in [
+            RECT {
+                left: r.left - 4,
+                top: r.top - 4,
+                right: r.right + 4,
+                bottom: r.top + 4,
+            },
+            RECT {
+                left: r.left - 4,
+                top: r.bottom - 4,
+                right: r.right + 4,
+                bottom: r.bottom + 4,
+            },
+            RECT {
+                left: r.left - 4,
+                top: r.top,
+                right: r.left + 4,
+                bottom: r.bottom,
+            },
+            RECT {
+                left: r.right - 4,
+                top: r.top,
+                right: r.right + 4,
+                bottom: r.bottom,
+            },
+        ] {
+            self.add_rect(edge);
+        }
+    }
+}
+impl Drop for PaintRegion {
+    fn drop(&mut self) {
+        unsafe {
+            DeleteObject(self.0);
+        }
+    }
+}
+fn display_selection(data: &View) -> RECT {
+    if data.selection.right > data.selection.left {
+        data.selection
+    } else {
+        data.hover
+    }
+}
+fn bounds_array(r: RECT) -> [i32; 4] {
+    [r.left, r.top, r.right, r.bottom]
+}
+#[derive(Clone, Copy)]
+struct CaptureVisual {
+    selection: RECT,
+    size_label: Option<RECT>,
+    magnifier: Option<RECT>,
+    toolbar: Option<RECT>,
+    hover_button: Option<usize>,
+    point: [i32; 2],
+}
+unsafe fn capture_visual(hwnd: HWND, data: &View) -> Option<CaptureVisual> {
+    if data.screen.is_none()
+        || !data.marks.is_empty()
+        || data.polyline_active
+        || data.selecting_text
+        || !data.text_selection.bounds.is_empty()
+    {
+        return None;
+    }
+    let selection = display_selection(data);
+    let p = data.point;
+    let mut client = RECT::default();
+    GetClientRect(hwnd, &mut client);
+    let magnifier = ((data.selection.right <= data.selection.left || data.tool == Tool::PickColor)
+        && p[0] >= 0
+        && p[1] >= 0
+        && p[0] < data.image.width() as i32
+        && p[1] < data.image.height() as i32)
+        .then(|| {
+            let left = (p[0] + 18).min(client.right - 280).max(0);
+            let top = (p[1] + 18).min(client.bottom - 140).max(0);
+            RECT {
+                left,
+                top,
+                right: left + 280,
+                bottom: top + 136,
+            }
+        });
+    Some(CaptureVisual {
+        selection,
+        size_label: (data.selection.right > data.selection.left).then_some(RECT {
+            left: selection.left,
+            top: (selection.top - 26).max(0),
+            right: selection.left + 160,
+            bottom: selection.top.max(26),
+        }),
+        magnifier,
+        toolbar: toolbar::visible(data).then(|| toolbar::layout(hwnd, data).bounds),
+        hover_button: data.hover_button,
+        point: p,
+    })
+}
+unsafe fn capture_damage(
+    before: Option<CaptureVisual>,
+    after: Option<CaptureVisual>,
+) -> Option<PaintRegion> {
+    let (before, after) = before.zip(after)?;
+    let damage = PaintRegion::rectangle(RECT::default())?;
+    let selection_changed = bounds_array(before.selection) != bounds_array(after.selection);
+    if selection_changed {
+        if let Some(a) = PaintRegion::rectangle(before.selection)
+            && let Some(b) = PaintRegion::rectangle(after.selection)
+        {
+            CombineRgn(damage.0, a.0, b.0, RGN_XOR);
+        } else {
+            return None;
+        }
+        damage.add_frame(before.selection);
+        damage.add_frame(after.selection);
+        for r in [before.size_label, after.size_label].into_iter().flatten() {
+            damage.add_rect(r);
+        }
+    }
+    if selection_changed
+        || before.point != after.point
+        || before.magnifier.map(bounds_array) != after.magnifier.map(bounds_array)
+    {
+        for r in [before.magnifier, after.magnifier].into_iter().flatten() {
+            damage.add_rect(r);
+        }
+    }
+    if before.hover_button != after.hover_button
+        || before.toolbar.map(bounds_array) != after.toolbar.map(bounds_array)
+    {
+        for r in [before.toolbar, after.toolbar].into_iter().flatten() {
+            damage.add_rect(r);
+        }
+    }
+    Some(damage)
+}
+
+unsafe fn invalidate_capture_change(hwnd: HWND, before: Option<CaptureVisual>, data: &View) {
+    if let Some(damage) = capture_damage(before, capture_visual(hwnd, data)) {
+        InvalidateRgn(hwnd, damage.0, 0);
+    } else {
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
+
 struct Detector {
     request: SyncSender<[i32; 2]>,
     result: Receiver<([i32; 2], [i32; 4])>,
@@ -250,21 +415,31 @@ impl Detector {
 }
 
 unsafe fn update_detection(hwnd: HWND, data: &mut View) {
-    let Some(detector) = &mut data.detector else {
-        return;
-    };
-    if let Ok((point, bounds)) = detector.result.try_recv() {
-        detector.pending = false;
-        if !data.dragging && data.selection.right <= data.selection.left && point == data.point {
-            data.hover = RECT {
-                left: bounds[0],
-                top: bounds[1],
-                right: bounds[2],
-                bottom: bounds[3],
-            };
-            InvalidateRect(hwnd, null(), 0);
+    let result = {
+        let Some(detector) = &mut data.detector else {
+            return;
+        };
+        let result = detector.result.try_recv();
+        if result.is_ok() {
+            detector.pending = false;
         }
+        result
+    };
+    if let Ok((point, bounds)) = result
+        && !data.dragging
+        && data.selection.right <= data.selection.left
+        && point == data.point
+    {
+        let before = capture_visual(hwnd, data);
+        data.hover = RECT {
+            left: bounds[0],
+            top: bounds[1],
+            right: bounds[2],
+            bottom: bounds[3],
+        };
+        invalidate_capture_change(hwnd, before, data);
     }
+    let detector = data.detector.as_mut().unwrap();
     if !data.dragging
         && data.selection.right <= data.selection.left
         && !detector.pending
@@ -407,8 +582,9 @@ unsafe fn create_view(
     };
     RegisterClassW(&wc);
     data.app = state;
+    // Frozen screenshot overlays are opaque; layered windows force costly full-surface composition.
     let hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED,
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if overlay { 0 } else { WS_EX_LAYERED },
         class.as_ptr(),
         wide(title).as_ptr(),
         WS_POPUP | WS_CLIPCHILDREN,
@@ -425,7 +601,9 @@ unsafe fn create_view(
         data.owned = true;
         let _ = Box::into_raw(data);
         state.windows.insert(hwnd as usize);
-        SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        if !overlay {
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+        }
         ShowWindow(hwnd, SW_SHOW);
         SetForegroundWindow(hwnd);
     }
@@ -454,6 +632,7 @@ fn empty_view(image: RgbaImage) -> Box<View> {
         detect_at: Instant::now(),
         detector: None,
         background: None,
+        shaded_background: None,
         backbuffer: None,
         font: null_mut(),
         alpha: 255,
@@ -1607,7 +1786,8 @@ unsafe fn start_long(hwnd: HWND) -> Result<()> {
     SetWindowLongPtrW(
         hwnd,
         GWL_EXSTYLE,
-        GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | (WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) as isize,
+        GetWindowLongPtrW(hwnd, GWL_EXSTYLE)
+            | (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE) as isize,
     );
     SetLayeredWindowAttributes(hwnd, 0, 255, LWA_COLORKEY | LWA_ALPHA);
     SetWindowTextW(
@@ -2337,6 +2517,357 @@ unsafe extern "system" fn controller_proc(
     }
     DefWindowProcW(hwnd, message, w, l)
 }
+unsafe fn shade_rect(dc: HDC, r: RECT) {
+    if r.right <= r.left || r.bottom <= r.top {
+        return;
+    }
+    let shade = CreateCompatibleDC(dc);
+    let black = CreateCompatibleBitmap(dc, 1, 1);
+    let previous = SelectObject(shade, black);
+    PatBlt(shade, 0, 0, 1, 1, BLACKNESS);
+    GdiAlphaBlend(
+        dc,
+        r.left,
+        r.top,
+        r.right - r.left,
+        r.bottom - r.top,
+        shade,
+        0,
+        0,
+        1,
+        1,
+        BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 100,
+            AlphaFormat: 0,
+        },
+    );
+    SelectObject(shade, previous);
+    DeleteObject(black);
+    DeleteDC(shade);
+}
+
+unsafe fn paint_view(hwnd: HWND, data: &mut View, target_dc: HDC, update: Option<HRGN>) {
+    let mut client = RECT::default();
+    GetClientRect(hwnd, &mut client);
+    if data.long.is_some() {
+        draw_long_frame(target_dc, client, data.selection);
+        return;
+    }
+    let size = [client.right.max(1), client.bottom.max(1)];
+    if data
+        .backbuffer
+        .as_ref()
+        .is_none_or(|surface| surface.size != size)
+    {
+        data.backbuffer = PaintSurface::new(target_dc, size);
+        data.background = None;
+        data.shaded_background = None;
+    }
+    let Some(buffer) = &data.backbuffer else {
+        return;
+    };
+    let dc = buffer.dc;
+    let saved = SaveDC(dc);
+    let target_saved = SaveDC(target_dc);
+    let mut dirty = client;
+    if let Some(region) = update {
+        SelectClipRgn(dc, region);
+        ExtSelectClipRgn(target_dc, region, RGN_AND);
+        GetRgnBox(region, &mut dirty);
+    }
+    if data.screen.is_some() {
+        if data.background.is_none() {
+            data.background = PaintSurface::new(target_dc, size);
+            if let Some(background) = &data.background {
+                draw_image(background.dc, &data.image, [0, 0, size[0], size[1]]);
+            }
+        }
+        if data.shaded_background.is_none()
+            && let Some(background) = &data.background
+        {
+            data.shaded_background = PaintSurface::new(target_dc, size);
+            if let Some(shaded) = &data.shaded_background {
+                BitBlt(
+                    shaded.dc,
+                    0,
+                    0,
+                    size[0],
+                    size[1],
+                    background.dc,
+                    0,
+                    0,
+                    SRCCOPY,
+                );
+                shade_rect(shaded.dc, client);
+            }
+        }
+        if let Some(shaded) = &data.shaded_background {
+            BitBlt(
+                dc,
+                dirty.left,
+                dirty.top,
+                dirty.right - dirty.left,
+                dirty.bottom - dirty.top,
+                shaded.dc,
+                dirty.left,
+                dirty.top,
+                SRCCOPY,
+            );
+            let selection = display_selection(data);
+            if let Some(background) = &data.background {
+                BitBlt(
+                    dc,
+                    selection.left,
+                    selection.top,
+                    selection.right - selection.left,
+                    selection.bottom - selection.top,
+                    background.dc,
+                    selection.left,
+                    selection.top,
+                    SRCCOPY,
+                );
+            }
+        } else {
+            draw_image(dc, &data.image, [0, 0, size[0], size[1]]);
+        }
+    } else if !data.marks.is_empty() {
+        if let Ok(image) = render_image(data, false) {
+            draw_image(dc, &image, [2, 2, client.right - 4, client.bottom - 4]);
+        }
+    } else {
+        let inset = if data.screen.is_none() && data.long.is_none() && data.list.is_null() {
+            2
+        } else {
+            0
+        };
+        draw_image(
+            dc,
+            &data.image,
+            [
+                inset,
+                inset,
+                client.right - inset * 2,
+                client.bottom - inset * 2,
+            ],
+        );
+    }
+    if data.screen.is_none() && data.long.is_none() && data.list.is_null() {
+        let brush = CreateSolidBrush(theme::BORDER);
+        FrameRect(dc, &client, brush);
+        DeleteObject(brush);
+        let inner = RECT {
+            left: 1,
+            top: 1,
+            right: client.right - 1,
+            bottom: client.bottom - 1,
+        };
+        FrameRect(dc, &inner, theme::surface_brush());
+    }
+    if data.screen.is_some() {
+        let selection = display_selection(data);
+        if data.shaded_background.is_none() {
+            for r in [
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: client.right,
+                    bottom: selection.top,
+                },
+                RECT {
+                    left: 0,
+                    top: selection.bottom,
+                    right: client.right,
+                    bottom: client.bottom,
+                },
+                RECT {
+                    left: 0,
+                    top: selection.top,
+                    right: selection.left,
+                    bottom: selection.bottom,
+                },
+                RECT {
+                    left: selection.right,
+                    top: selection.top,
+                    right: client.right,
+                    bottom: selection.bottom,
+                },
+            ] {
+                shade_rect(dc, r);
+            }
+        }
+        let pen = CreatePen(PS_SOLID, 2, theme::ACCENT);
+        let old_pen = SelectObject(dc, pen);
+        let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(
+            dc,
+            selection.left,
+            selection.top,
+            selection.right,
+            selection.bottom,
+        );
+        SelectObject(dc, old_brush);
+        SelectObject(dc, old_pen);
+        DeleteObject(pen);
+        if !data.marks.is_empty()
+            && let Ok(image) = render_image(data, false)
+        {
+            draw_image(
+                dc,
+                &image,
+                [
+                    data.selection.left,
+                    data.selection.top,
+                    data.selection.right - data.selection.left,
+                    data.selection.bottom - data.selection.top,
+                ],
+            );
+        }
+        if data.selection.right > data.selection.left {
+            let brush = CreateSolidBrush(theme::ACCENT);
+            FrameRect(dc, &selection, brush);
+            let mid_x = (selection.left + selection.right) / 2;
+            let mid_y = (selection.top + selection.bottom) / 2;
+            for [x, y] in [
+                [selection.left, selection.top],
+                [mid_x, selection.top],
+                [selection.right, selection.top],
+                [selection.left, mid_y],
+                [selection.right, mid_y],
+                [selection.left, selection.bottom],
+                [mid_x, selection.bottom],
+                [selection.right, selection.bottom],
+            ] {
+                let r = RECT {
+                    left: x - 3,
+                    top: y - 3,
+                    right: x + 4,
+                    bottom: y + 4,
+                };
+                FillRect(dc, &r, theme::surface_brush());
+                SetTextColor(dc, theme::TEXT);
+                SetBkMode(dc, TRANSPARENT as i32);
+                FrameRect(dc, &r, brush);
+            }
+            DeleteObject(brush);
+            let label = format!(
+                "{} × {}",
+                selection.right - selection.left,
+                selection.bottom - selection.top
+            );
+            let mut r = RECT {
+                left: selection.left,
+                top: (selection.top - 26).max(0),
+                right: selection.left + 160,
+                bottom: selection.top.max(26),
+            };
+            FillRect(dc, &r, GetStockObject(BLACK_BRUSH) as HBRUSH);
+            SetBkMode(dc, TRANSPARENT as i32);
+            SetTextColor(dc, 0xffffff);
+            SelectObject(dc, data.font);
+            DrawTextW(
+                dc,
+                wide(&label).as_ptr(),
+                -1,
+                &mut r,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+            );
+        }
+        let p = data.point;
+        if (data.selection.right <= data.selection.left || data.tool == Tool::PickColor)
+            && p[0] >= 0
+            && p[1] >= 0
+            && p[0] < data.image.width() as i32
+            && p[1] < data.image.height() as i32
+        {
+            let pixel = data.image.get_pixel(p[0] as u32, p[1] as u32);
+            let mut r = RECT {
+                left: (p[0] + 18).min(client.right - 280).max(0),
+                top: (p[1] + 18).min(client.bottom - 140).max(0),
+                right: 0,
+                bottom: 0,
+            };
+            r.right = r.left + 280;
+            r.bottom = r.top + 136;
+            FillRect(dc, &r, theme::surface_brush());
+            SetTextColor(dc, theme::TEXT);
+            SetBkMode(dc, TRANSPARENT as i32);
+            let zoom = image::imageops::crop_imm(
+                &data.image,
+                (p[0] - 5).max(0) as u32,
+                (p[1] - 5).max(0) as u32,
+                11.min(data.image.width() - (p[0] - 5).max(0) as u32),
+                11.min(data.image.height() - (p[1] - 5).max(0) as u32),
+            )
+            .to_image();
+            draw_pixels(dc, &zoom, [r.left + 8, r.top + 8, 77, 77]);
+            let cx = (p[0] - (p[0] - 5).max(0)) * 7 + r.left + 8;
+            let cy = (p[1] - (p[1] - 5).max(0)) * 7 + r.top + 8;
+            FrameRect(
+                dc,
+                &RECT {
+                    left: cx,
+                    top: cy,
+                    right: cx + 7,
+                    bottom: cy + 7,
+                },
+                GetStockObject(BLACK_BRUSH) as HBRUSH,
+            );
+            let label = format!(
+                "{}×{}\n{}\n单击复制颜色",
+                selection.right - selection.left,
+                selection.bottom - selection.top,
+                color_value(*pixel, &(*data.app).settings.color_format)
+            );
+            r.left += 96;
+            SelectObject(dc, data.font);
+            SetBkMode(dc, TRANSPARENT as i32);
+            DrawTextW(dc, wide(&label).as_ptr(), -1, &mut r, DT_LEFT);
+        }
+    }
+    if data.text_selection_enabled {
+        let (sx, sy, padding) = if data.screen.is_some() {
+            (1.0, 1.0, 0)
+        } else {
+            (
+                (client.right - 4) as f32 / data.image.width() as f32,
+                (client.bottom - 4) as f32 / data.image.height() as f32,
+                2,
+            )
+        };
+        let brush = CreateSolidBrush(theme::ACCENT);
+        for &[x, y, width, height] in &data.text_selection.bounds {
+            let x = x + data.recognition_origin[0] as f32;
+            let y = y + data.recognition_origin[1] as f32;
+            let r = RECT {
+                left: padding + (x * sx) as i32,
+                top: padding + (y * sy) as i32,
+                right: padding + ((x + width) * sx).ceil() as i32,
+                bottom: padding + ((y + height) * sy).ceil() as i32,
+            };
+            FrameRect(dc, &r, brush);
+        }
+        DeleteObject(brush);
+    }
+    if toolbar::visible(data) {
+        toolbar::draw(dc, data, &toolbar::layout(hwnd, data));
+    }
+    BitBlt(
+        target_dc,
+        dirty.left,
+        dirty.top,
+        dirty.right - dirty.left,
+        dirty.bottom - dirty.top,
+        dc,
+        dirty.left,
+        dirty.top,
+        SRCCOPY,
+    );
+    RestoreDC(target_dc, target_saved);
+    RestoreDC(dc, saved);
+}
+
 unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = &*(l as *const CREATESTRUCTW);
@@ -2372,312 +2903,13 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_PAINT | WM_PRINTCLIENT => {
-            let mut paint: PAINTSTRUCT = zeroed();
-            let target_dc = if message == WM_PRINTCLIENT {
-                w as HDC
+            if message == WM_PRINTCLIENT {
+                paint_view(hwnd, data, w as HDC, None);
             } else {
-                BeginPaint(hwnd, &mut paint)
-            };
-            let mut client = RECT::default();
-            GetClientRect(hwnd, &mut client);
-            if data.long.is_some() {
-                draw_long_frame(target_dc, client, data.selection);
-                if message == WM_PAINT {
-                    EndPaint(hwnd, &paint);
-                }
-                return 0;
-            }
-            let size = [client.right.max(1), client.bottom.max(1)];
-            if data
-                .backbuffer
-                .as_ref()
-                .is_none_or(|surface| surface.size != size)
-            {
-                data.backbuffer = PaintSurface::new(target_dc, size);
-                data.background = None;
-            }
-            let Some(buffer) = &data.backbuffer else {
-                if message == WM_PAINT {
-                    EndPaint(hwnd, &paint);
-                }
-                return 0;
-            };
-            let dc = buffer.dc;
-            let saved = SaveDC(dc);
-            if data.screen.is_some() {
-                if data.background.is_none() {
-                    data.background = PaintSurface::new(target_dc, size);
-                    if let Some(background) = &data.background {
-                        draw_image(background.dc, &data.image, [0, 0, size[0], size[1]]);
-                    }
-                }
-                if let Some(background) = &data.background {
-                    BitBlt(dc, 0, 0, size[0], size[1], background.dc, 0, 0, SRCCOPY);
-                } else {
-                    draw_image(dc, &data.image, [0, 0, size[0], size[1]]);
-                }
-            } else if !data.marks.is_empty() {
-                if let Ok(image) = render_image(data, false) {
-                    draw_image(dc, &image, [2, 2, client.right - 4, client.bottom - 4]);
-                }
-            } else {
-                let inset = if data.screen.is_none() && data.long.is_none() && data.list.is_null() {
-                    2
-                } else {
-                    0
-                };
-                draw_image(
-                    dc,
-                    &data.image,
-                    [
-                        inset,
-                        inset,
-                        client.right - inset * 2,
-                        client.bottom - inset * 2,
-                    ],
-                );
-            }
-            if data.screen.is_none() && data.long.is_none() && data.list.is_null() {
-                let brush = CreateSolidBrush(theme::BORDER);
-                FrameRect(dc, &client, brush);
-                DeleteObject(brush);
-                let inner = RECT {
-                    left: 1,
-                    top: 1,
-                    right: client.right - 1,
-                    bottom: client.bottom - 1,
-                };
-                FrameRect(dc, &inner, theme::surface_brush());
-            }
-            if data.screen.is_some() {
-                let selection = if data.selection.right > data.selection.left {
-                    data.selection
-                } else {
-                    data.hover
-                };
-                let shade = CreateCompatibleDC(dc);
-                let black = CreateCompatibleBitmap(dc, 1, 1);
-                let previous = SelectObject(shade, black);
-                PatBlt(shade, 0, 0, 1, 1, BLACKNESS);
-                for r in [
-                    RECT {
-                        left: 0,
-                        top: 0,
-                        right: client.right,
-                        bottom: selection.top,
-                    },
-                    RECT {
-                        left: 0,
-                        top: selection.bottom,
-                        right: client.right,
-                        bottom: client.bottom,
-                    },
-                    RECT {
-                        left: 0,
-                        top: selection.top,
-                        right: selection.left,
-                        bottom: selection.bottom,
-                    },
-                    RECT {
-                        left: selection.right,
-                        top: selection.top,
-                        right: client.right,
-                        bottom: selection.bottom,
-                    },
-                ] {
-                    if r.right > r.left && r.bottom > r.top {
-                        GdiAlphaBlend(
-                            dc,
-                            r.left,
-                            r.top,
-                            r.right - r.left,
-                            r.bottom - r.top,
-                            shade,
-                            0,
-                            0,
-                            1,
-                            1,
-                            BLENDFUNCTION {
-                                BlendOp: AC_SRC_OVER as u8,
-                                BlendFlags: 0,
-                                SourceConstantAlpha: 100,
-                                AlphaFormat: 0,
-                            },
-                        );
-                    }
-                }
-                SelectObject(shade, previous);
-                DeleteObject(black);
-                DeleteDC(shade);
-                let pen = CreatePen(PS_SOLID, 2, theme::ACCENT);
-                let old_pen = SelectObject(dc, pen);
-                let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
-                Rectangle(
-                    dc,
-                    selection.left,
-                    selection.top,
-                    selection.right,
-                    selection.bottom,
-                );
-                SelectObject(dc, old_brush);
-                SelectObject(dc, old_pen);
-                DeleteObject(pen);
-                if !data.marks.is_empty()
-                    && let Ok(image) = render_image(data, false)
-                {
-                    draw_image(
-                        dc,
-                        &image,
-                        [
-                            data.selection.left,
-                            data.selection.top,
-                            data.selection.right - data.selection.left,
-                            data.selection.bottom - data.selection.top,
-                        ],
-                    );
-                }
-                if data.selection.right > data.selection.left {
-                    let brush = CreateSolidBrush(theme::ACCENT);
-                    FrameRect(dc, &selection, brush);
-                    let mid_x = (selection.left + selection.right) / 2;
-                    let mid_y = (selection.top + selection.bottom) / 2;
-                    for [x, y] in [
-                        [selection.left, selection.top],
-                        [mid_x, selection.top],
-                        [selection.right, selection.top],
-                        [selection.left, mid_y],
-                        [selection.right, mid_y],
-                        [selection.left, selection.bottom],
-                        [mid_x, selection.bottom],
-                        [selection.right, selection.bottom],
-                    ] {
-                        let r = RECT {
-                            left: x - 3,
-                            top: y - 3,
-                            right: x + 4,
-                            bottom: y + 4,
-                        };
-                        FillRect(dc, &r, theme::surface_brush());
-                        SetTextColor(dc, theme::TEXT);
-                        SetBkMode(dc, TRANSPARENT as i32);
-                        FrameRect(dc, &r, brush);
-                    }
-                    DeleteObject(brush);
-                    let label = format!(
-                        "{} × {}",
-                        selection.right - selection.left,
-                        selection.bottom - selection.top
-                    );
-                    let mut r = RECT {
-                        left: selection.left,
-                        top: (selection.top - 26).max(0),
-                        right: selection.left + 160,
-                        bottom: selection.top.max(26),
-                    };
-                    FillRect(dc, &r, GetStockObject(BLACK_BRUSH) as HBRUSH);
-                    SetBkMode(dc, TRANSPARENT as i32);
-                    SetTextColor(dc, 0xffffff);
-                    SelectObject(dc, data.font);
-                    DrawTextW(
-                        dc,
-                        wide(&label).as_ptr(),
-                        -1,
-                        &mut r,
-                        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-                    );
-                }
-                let p = data.point;
-                if (data.selection.right <= data.selection.left || data.tool == Tool::PickColor)
-                    && p[0] >= 0
-                    && p[1] >= 0
-                    && p[0] < data.image.width() as i32
-                    && p[1] < data.image.height() as i32
-                {
-                    let pixel = data.image.get_pixel(p[0] as u32, p[1] as u32);
-                    let mut r = RECT {
-                        left: (p[0] + 18).min(client.right - 280).max(0),
-                        top: (p[1] + 18).min(client.bottom - 140).max(0),
-                        right: 0,
-                        bottom: 0,
-                    };
-                    r.right = r.left + 280;
-                    r.bottom = r.top + 136;
-                    FillRect(dc, &r, theme::surface_brush());
-                    SetTextColor(dc, theme::TEXT);
-                    SetBkMode(dc, TRANSPARENT as i32);
-                    let zoom = image::imageops::crop_imm(
-                        &data.image,
-                        (p[0] - 5).max(0) as u32,
-                        (p[1] - 5).max(0) as u32,
-                        11.min(data.image.width() - (p[0] - 5).max(0) as u32),
-                        11.min(data.image.height() - (p[1] - 5).max(0) as u32),
-                    )
-                    .to_image();
-                    draw_pixels(dc, &zoom, [r.left + 8, r.top + 8, 77, 77]);
-                    let cx = (p[0] - (p[0] - 5).max(0)) * 7 + r.left + 8;
-                    let cy = (p[1] - (p[1] - 5).max(0)) * 7 + r.top + 8;
-                    FrameRect(
-                        dc,
-                        &RECT {
-                            left: cx,
-                            top: cy,
-                            right: cx + 7,
-                            bottom: cy + 7,
-                        },
-                        GetStockObject(BLACK_BRUSH) as HBRUSH,
-                    );
-                    let label = format!(
-                        "{}×{}\n{}\n单击复制颜色",
-                        selection.right - selection.left,
-                        selection.bottom - selection.top,
-                        color_value(*pixel, &(*data.app).settings.color_format)
-                    );
-                    r.left += 96;
-                    SelectObject(dc, data.font);
-                    SetBkMode(dc, TRANSPARENT as i32);
-                    DrawTextW(dc, wide(&label).as_ptr(), -1, &mut r, DT_LEFT);
-                }
-            }
-            if data.text_selection_enabled {
-                let (sx, sy, padding) = if data.screen.is_some() {
-                    (1.0, 1.0, 0)
-                } else {
-                    (
-                        (client.right - 4) as f32 / data.image.width() as f32,
-                        (client.bottom - 4) as f32 / data.image.height() as f32,
-                        2,
-                    )
-                };
-                let brush = CreateSolidBrush(theme::ACCENT);
-                for &[x, y, width, height] in &data.text_selection.bounds {
-                    let x = x + data.recognition_origin[0] as f32;
-                    let y = y + data.recognition_origin[1] as f32;
-                    let r = RECT {
-                        left: padding + (x * sx) as i32,
-                        top: padding + (y * sy) as i32,
-                        right: padding + ((x + width) * sx).ceil() as i32,
-                        bottom: padding + ((y + height) * sy).ceil() as i32,
-                    };
-                    FrameRect(dc, &r, brush);
-                }
-                DeleteObject(brush);
-            }
-            if toolbar::visible(data) {
-                toolbar::draw(dc, data, &toolbar::layout(hwnd, data));
-            }
-            RestoreDC(dc, saved);
-            BitBlt(
-                target_dc,
-                0,
-                0,
-                client.right,
-                client.bottom,
-                dc,
-                0,
-                0,
-                SRCCOPY,
-            );
-            if message == WM_PAINT {
+                let update = PaintRegion::window_update(hwnd);
+                let mut paint: PAINTSTRUCT = zeroed();
+                let dc = BeginPaint(hwnd, &mut paint);
+                paint_view(hwnd, data, dc, update.as_ref().map(|r| r.0));
                 EndPaint(hwnd, &paint);
             }
             return 0;
@@ -2800,6 +3032,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             if data.long.is_some() {
                 return 0;
             }
+            let before = capture_visual(hwnd, data);
             let p = point(l);
             let image_p = image_point(hwnd, data, p);
             data.point = p;
@@ -2812,7 +3045,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 && toolbar::visible(data)
                 && contains(toolbar::layout(hwnd, data).bounds, p)
             {
-                InvalidateRect(hwnd, null(), 0);
+                invalidate_capture_change(hwnd, before, data);
                 return 0;
             }
             if data.polyline_active
@@ -2826,7 +3059,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 } else {
                     image_p
                 };
-                InvalidateRect(hwnd, null(), 0);
+                invalidate_capture_change(hwnd, before, data);
                 return 0;
             }
             if data.dragging {
@@ -2835,7 +3068,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 } else if data.tool == Tool::Select && data.screen.is_some() {
                     if data.selection_drag != 0 {
                         adjust_selection(data, p);
-                        InvalidateRect(hwnd, null(), 0);
+                        invalidate_capture_change(hwnd, before, data);
                         return 0;
                     }
                     data.selection = rect(
@@ -2878,7 +3111,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
             }
             update_detection(hwnd, data);
-            InvalidateRect(hwnd, null(), 0);
+            invalidate_capture_change(hwnd, before, data);
             return 0;
         }
         WM_SETCURSOR if l as u32 & 0xffff == HTCLIENT => {
@@ -3821,6 +4054,268 @@ mod tests {
             );
             DestroyWindow(window);
             assert!(state.windows.is_empty());
+        }
+    }
+
+    unsafe fn surface_pixels(surface: &PaintSurface) -> Vec<u8> {
+        GdiFlush();
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = surface.size[0];
+        info.bmiHeader.biHeight = -surface.size[1];
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        let mut pixels = vec![0; (surface.size[0] * surface.size[1] * 4) as usize];
+        SelectObject(surface.dc, surface.previous);
+        let rows = GetDIBits(
+            surface.dc,
+            surface.bitmap,
+            0,
+            surface.size[1] as u32,
+            pixels.as_mut_ptr().cast(),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        SelectObject(surface.dc, surface.bitmap);
+        assert_eq!(rows, surface.size[1]);
+        pixels
+    }
+
+    #[test]
+    fn dirty_capture_frames_match_full_frames_without_pointer_or_selection_trails() {
+        unsafe {
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let mut data = empty_view(RgbaImage::from_fn(1000, 700, |x, y| {
+                Rgba([(x % 251) as u8, (y % 251) as u8, 180, 255])
+            }));
+            data.app = &mut state;
+            data.screen = Some(RECT {
+                left: 0,
+                top: 0,
+                right: 1000,
+                bottom: 700,
+            });
+            let class = wide("ptools.capture.damage-test");
+            let module = GetModuleHandleW(null());
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(view_proc),
+                hInstance: module,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            };
+            RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                class.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1000,
+                700,
+                null_mut(),
+                null_mut(),
+                module,
+                (&mut *data as *mut View).cast(),
+            );
+            assert!(!hwnd.is_null());
+            let dc = GetDC(null_mut());
+            let partial = PaintSurface::new(dc, [1000, 700]).unwrap();
+            let full = PaintSurface::new(dc, [1000, 700]).unwrap();
+            ReleaseDC(null_mut(), dc);
+            paint_view(hwnd, &mut data, partial.dc, None);
+            ValidateRect(hwnd, null());
+            let steps = [
+                (WM_MOUSEMOVE, 50, 50),
+                (WM_MOUSEMOVE, 300, 200),
+                (WM_MOUSEMOVE, 995, 695),
+                (WM_LBUTTONDOWN, 160, 140),
+                (WM_MOUSEMOVE, 750, 480),
+                (WM_MOUSEMOVE, 300, 250),
+                (WM_MOUSEMOVE, 80, 50),
+                (WM_MOUSEMOVE, 995, 695),
+                (WM_LBUTTONUP, 800, 500),
+                (WM_MOUSEMOVE, 400, 550),
+                (WM_MOUSEMOVE, 20, 20),
+            ];
+            for (step, (message, x, y)) in steps.into_iter().enumerate() {
+                let before = capture_visual(hwnd, &data);
+                SendMessageW(hwnd, message, 0, (x | y << 16) as isize);
+                let damage = if message == WM_MOUSEMOVE {
+                    capture_damage(before, capture_visual(hwnd, &data))
+                } else {
+                    None
+                };
+                paint_view(hwnd, &mut data, partial.dc, damage.as_ref().map(|r| r.0));
+                ValidateRect(hwnd, null());
+                paint_view(hwnd, &mut data, full.dc, None);
+                let partial_pixels = surface_pixels(&partial);
+                let full_pixels = surface_pixels(&full);
+                if let Some(offset) = partial_pixels
+                    .iter()
+                    .zip(&full_pixels)
+                    .position(|(a, b)| a != b)
+                {
+                    panic!(
+                        "partial frame differs at step {step}, pixel {},{}",
+                        (offset / 4) % 1000,
+                        (offset / 4) / 1000
+                    );
+                }
+            }
+            data.selection = RECT::default();
+            data.dragging = false;
+            data.point = [300, 200];
+            paint_view(hwnd, &mut data, partial.dc, None);
+            for hover in [
+                RECT {
+                    left: 20,
+                    top: 20,
+                    right: 500,
+                    bottom: 400,
+                },
+                RECT {
+                    left: 700,
+                    top: 300,
+                    right: 950,
+                    bottom: 650,
+                },
+            ] {
+                let before = capture_visual(hwnd, &data);
+                data.hover = hover;
+                let damage = capture_damage(before, capture_visual(hwnd, &data)).unwrap();
+                paint_view(hwnd, &mut data, partial.dc, Some(damage.0));
+                paint_view(hwnd, &mut data, full.dc, None);
+                assert_eq!(
+                    surface_pixels(&partial),
+                    surface_pixels(&full),
+                    "async hover left stale pixels"
+                );
+            }
+            data.selection = RECT {
+                left: 160,
+                top: 140,
+                right: 800,
+                bottom: 500,
+            };
+            paint_view(hwnd, &mut data, partial.dc, None);
+            // A completed selection does not repaint just because the pointer moved outside it.
+            ValidateRect(hwnd, null());
+            let before = capture_visual(hwnd, &data);
+            SendMessageW(hwnd, WM_MOUSEMOVE, 0, (30 | 30 << 16) as isize);
+            let damage = capture_damage(before, capture_visual(hwnd, &data)).unwrap();
+            assert_eq!(GetRgnBox(damage.0, &mut RECT::default()), NULLREGION);
+            ReleaseCapture();
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    #[ignore = "manual pointer-to-paint performance probe"]
+    fn benchmark_capture_pointer_pipeline() {
+        unsafe {
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let desktop = [
+                GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                GetSystemMetrics(SM_CYVIRTUALSCREEN),
+            ];
+            let mut reports = vec![];
+            for size in [[3840, 2160], desktop] {
+                let mut data = empty_view(RgbaImage::from_pixel(
+                    size[0] as u32,
+                    size[1] as u32,
+                    Rgba([60, 120, 180, 255]),
+                ));
+                data.app = &mut state;
+                data.screen = Some(RECT {
+                    left: 0,
+                    top: 0,
+                    right: size[0],
+                    bottom: size[1],
+                });
+                let class = wide("ptools.capture.pointer-benchmark");
+                let module = GetModuleHandleW(null());
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(view_proc),
+                    hInstance: module,
+                    lpszClassName: class.as_ptr(),
+                    ..zeroed()
+                };
+                RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    0,
+                    class.as_ptr(),
+                    class.as_ptr(),
+                    WS_POPUP,
+                    0,
+                    0,
+                    size[0],
+                    size[1],
+                    null_mut(),
+                    null_mut(),
+                    module,
+                    (&mut *data as *mut View).cast(),
+                );
+                assert!(!hwnd.is_null());
+                let dc = GetDC(null_mut());
+                let output = PaintSurface::new(dc, size).unwrap();
+                ReleaseDC(null_mut(), dc);
+                for partial in [false, true] {
+                    for dragging in [false, true] {
+                        data.dragging = dragging;
+                        data.start = [200, 200];
+                        data.selection = RECT::default();
+                        paint_view(hwnd, &mut data, output.dc, None);
+                        ValidateRect(hwnd, null());
+                        let mut frames = vec![];
+                        for frame in 0..45 {
+                            let p = [800 + frame * 12, 600 + frame * 6];
+                            let start = Instant::now();
+                            let before = capture_visual(hwnd, &data);
+                            SendMessageW(
+                                hwnd,
+                                WM_MOUSEMOVE,
+                                usize::from(dragging),
+                                (p[0] | p[1] << 16) as isize,
+                            );
+                            let update = if partial {
+                                capture_damage(before, capture_visual(hwnd, &data))
+                            } else {
+                                None
+                            };
+                            paint_view(hwnd, &mut data, output.dc, update.as_ref().map(|r| r.0));
+                            ValidateRect(hwnd, null());
+                            GdiFlush();
+                            if frame >= 5 {
+                                frames.push(start.elapsed().as_secs_f64() * 1000.0);
+                            }
+                        }
+                        frames.sort_by(f64::total_cmp);
+                        let report = serde_json::json!({"size":size,"dragging":dragging,"partial":partial,"median_ms":frames[frames.len()/2],"p95_ms":frames[frames.len()*95/100]});
+                        eprintln!("pointer pipeline {report}");
+                        reports.push(report);
+                    }
+                }
+                DestroyWindow(hwnd);
+            }
+            if let Some(path) = std::env::var_os("PTOOLS_POINTER_BENCHMARK") {
+                fs::write(path, serde_json::to_vec_pretty(&reports).unwrap()).unwrap();
+            }
         }
     }
 
