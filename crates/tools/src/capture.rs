@@ -22,7 +22,10 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::{DataExchange::*, LibraryLoader::GetModuleHandleW},
-    UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+    UI::{
+        Controls::*, HiDpi::*, Input::Ime::*, Input::KeyboardAndMouse::*, Shell::*,
+        WindowsAndMessaging::*,
+    },
 };
 
 const WM_IDLE: u32 = WM_APP + 21;
@@ -46,6 +49,8 @@ const LONG_HOTKEYS: [(i32, u32, u32, usize); 5] = [
 pub struct Settings {
     pub history_days: u32,
     pub color_format: String,
+    pub annotation_color: u32,
+    pub annotation_stroke: i32,
     pub detect_ui: bool,
     pub include_cursor: bool,
     pub radius: u32,
@@ -62,6 +67,8 @@ impl Default for Settings {
         Self {
             history_days: 7,
             color_format: "HEX".into(),
+            annotation_color: toolbar::COLORS[0],
+            annotation_stroke: 3,
             detect_ui: true,
             include_cursor: false,
             radius: 0,
@@ -586,6 +593,7 @@ unsafe fn create_view(
     };
     RegisterClassW(&wc);
     data.app = state;
+    apply_saved_style(&mut data, &state.settings);
     // Frozen screenshot overlays are opaque; layered windows force costly full-surface composition.
     let hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | if overlay { 0 } else { WS_EX_LAYERED },
@@ -602,6 +610,8 @@ unsafe fn create_view(
         (&mut *data as *mut View).cast(),
     );
     if !hwnd.is_null() {
+        // The canvas receives tool keys directly; only text EDIT controls use an IME.
+        ImmAssociateContextEx(hwnd, null_mut(), 0);
         data.owned = true;
         let _ = Box::into_raw(data);
         state.windows.insert(hwnd as usize);
@@ -613,6 +623,53 @@ unsafe fn create_view(
     }
     hwnd
 }
+fn apply_saved_style(data: &mut View, settings: &Settings) {
+    data.color = if settings.annotation_color <= 0x00ffffff {
+        settings.annotation_color
+    } else {
+        toolbar::COLORS[0]
+    };
+    data.stroke = settings.annotation_stroke.clamp(1, 32);
+}
+unsafe fn persist_style(data: &View) -> Result<()> {
+    let state = &mut *data.app;
+    let mut next = state.settings.clone();
+    if next.annotation_color > 0x00ffffff {
+        next.annotation_color = toolbar::COLORS[0];
+    }
+    if data.color <= 0x00ffffff {
+        next.annotation_color = data.color;
+    }
+    next.annotation_stroke = data.stroke.clamp(1, 32);
+    if next.annotation_color == state.settings.annotation_color
+        && next.annotation_stroke == state.settings.annotation_stroke
+    {
+        return Ok(());
+    }
+    if !state.root.as_os_str().is_empty() {
+        let path = state.root.join("settings.json");
+        let mut document: serde_json::Value = read_json(&path)?;
+        if document.is_null() {
+            document = serde_json::json!({});
+        }
+        let object = document.as_object_mut().ok_or("截图设置必须是 JSON 对象")?;
+        object.insert("annotation_color".into(), next.annotation_color.into());
+        object.insert("annotation_stroke".into(), next.annotation_stroke.into());
+        write_json(&path, &document)?;
+    }
+    state.settings = next;
+    Ok(())
+}
+fn toggle_text_selection(data: &mut View) {
+    data.text_selection_enabled = !data.text_selection_enabled;
+    data.text_selection = TextSelection::default();
+    data.selecting_text = false;
+    if data.text_selection_enabled {
+        data.recognition_attempted = data.recognition.is_some();
+        data.recognition_error = None;
+    }
+}
+
 fn empty_view(image: RgbaImage) -> Box<View> {
     Box::new(View {
         app: null_mut(),
@@ -1586,6 +1643,7 @@ fn clear_recognition(data: &mut View) {
 
 unsafe fn text_hit(hwnd: HWND, data: &View, p: [i32; 2]) -> bool {
     if !data.text_selection_enabled
+        || data.tool != Tool::Select
         || data.recognition_pending
         || data.polyline_active
         || !data.list.is_null()
@@ -1963,14 +2021,15 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
         ReleaseCapture();
     }
     if let Some(tool) = selected_tool(id) {
+        if id == 0 && data.tool == Tool::Select {
+            toggle_text_selection(data);
+        }
         finish_polyline(data);
         data.tool = tool;
         if tool != Tool::Pen && data.color == toolbar::MOSAIC_COLOR {
-            data.color = toolbar::COLORS[0];
+            data.color = (*data.app).settings.annotation_color.min(0x00ffffff);
         }
-        if tool == Tool::Highlight {
-            data.color = toolbar::COLORS[2];
-        }
+        data.text_selection = TextSelection::default();
         data.selecting_text = false;
         if data.screen.is_none() {
             data.editing = true;
@@ -1985,12 +2044,12 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
     let state = &mut *data.app;
     match id {
         12 => {
-            data.text_selection_enabled = !data.text_selection_enabled;
-            data.text_selection = TextSelection::default();
-            data.selecting_text = false;
-            if data.text_selection_enabled {
-                data.recognition_attempted = data.recognition.is_some();
-                data.recognition_error = None;
+            finish_polyline(data);
+            toggle_text_selection(data);
+            data.tool = Tool::Select;
+            if data.screen.is_none() {
+                data.editing = true;
+                toolbar::sync_pin(hwnd);
             }
         }
         9 => {
@@ -2080,7 +2139,10 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
             }
         }
         25 => copy_selected_text(hwnd, data)?,
-        30..=37 => data.color = toolbar::COLORS[id - 30],
+        30..=37 => {
+            data.color = toolbar::COLORS[id - 30];
+            persist_style(data)?;
+        }
         38 => {
             finish_polyline(data);
             data.tool = Tool::Pen;
@@ -2090,7 +2152,10 @@ unsafe fn command(hwnd: HWND, id: usize) -> Result<()> {
                 toolbar::sync_pin(hwnd);
             }
         }
-        40..=42 => data.stroke = [2, 3, 6][id - 40],
+        40..=42 => {
+            data.stroke = [2, 3, 6][id - 40];
+            persist_style(data)?;
+        }
         100 => {
             DestroyWindow(hwnd);
             return Ok(());
@@ -2348,6 +2413,13 @@ pub fn run(initial: Option<Invocation>, smoke: bool) -> Result<()> {
         }
         let mut message: MSG = zeroed();
         while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            if message.message == WM_KEYDOWN
+                && state.windows.contains(&(message.hwnd as usize))
+                && !view(message.hwnd).is_null()
+                && (*view(message.hwnd)).text_editor.is_none()
+            {
+                message.wParam = canvas_key(message.hwnd, message.wParam, message.lParam);
+            }
             if message.message == WM_KEYDOWN && GetDlgCtrlID(message.hwnd) == 1 {
                 let parent = GetParent(message.hwnd);
                 if !view(parent).is_null() && !(*view(parent)).list.is_null() {
@@ -2834,7 +2906,7 @@ unsafe fn paint_view(hwnd: HWND, data: &mut View, target_dc: HDC, update: Option
             DrawTextW(dc, wide(&label).as_ptr(), -1, &mut r, DT_LEFT);
         }
     }
-    if data.text_selection_enabled {
+    if data.text_selection_enabled && data.tool == Tool::Select {
         let (sx, sy, padding) = if data.screen.is_some() {
             (1.0, 1.0, 0)
         } else {
@@ -2876,6 +2948,23 @@ unsafe fn paint_view(hwnd: HWND, data: &mut View, target_dc: HDC, update: Option
     RestoreDC(dc, saved);
 }
 
+unsafe fn canvas_key(hwnd: HWND, key: WPARAM, l: LPARAM) -> WPARAM {
+    if key != VK_PROCESSKEY as usize {
+        return key;
+    }
+    let original = ImmGetVirtualKey(hwnd);
+    if original != 0 && original != VK_PROCESSKEY as u32 {
+        return original as usize;
+    }
+    let scan = ((l >> 16) & 0xff) as u32;
+    let mapped = MapVirtualKeyW(scan, MAPVK_VSC_TO_VK_EX);
+    if scan != 0 && mapped != 0 {
+        mapped as usize
+    } else {
+        key
+    }
+}
+
 unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     if message == WM_NCCREATE {
         let create = &*(l as *const CREATESTRUCTW);
@@ -2886,6 +2975,11 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         return DefWindowProcW(hwnd, message, w, l);
     }
     let data = &mut *ptr;
+    let w = if message == WM_KEYDOWN && data.text_editor.is_none() {
+        canvas_key(hwnd, w, l)
+    } else {
+        w
+    };
     match message {
         WM_CREATE => {
             data.font = CreateFontW(
@@ -2909,6 +3003,13 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 SetTimer(hwnd, 7, 16, None);
             }
             return 0;
+        }
+        WM_SETFOCUS => {
+            ImmAssociateContextEx(hwnd, null_mut(), 0);
+            return 0;
+        }
+        WM_INPUTLANGCHANGE => {
+            ImmAssociateContextEx(hwnd, null_mut(), 0);
         }
         WM_PAINT | WM_PRINTCLIENT => {
             if message == WM_PRINTCLIENT {
@@ -3264,12 +3365,19 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             if data.long.is_some() {
                 return 0;
             }
+            let p = point(l);
+            let bar = toolbar::layout(hwnd, data);
+            if toolbar::visible(data) && contains(bar.bounds, p) {
+                if let Err(error) = toolbar::click(hwnd, hwnd, p) {
+                    alert(hwnd, &error);
+                }
+                return 0;
+            }
             if data.polyline_active {
                 finish_polyline(data);
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
-            let p = point(l);
             if text_hit(hwnd, data, p) {
                 data.start = p;
                 select_text(hwnd, data, p);
@@ -3354,6 +3462,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         WM_CAPTURECHANGED => {
             if data.slider_window == hwnd {
                 data.slider_window = null_mut();
+                if let Err(error) = persist_style(data) {
+                    alert(hwnd, &error);
+                }
             }
             tooltip::hide(data);
             data.dragging = false;
@@ -3370,7 +3481,6 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 (9, "复制图片"),
                 (10, "另建贴图"),
                 (11, "另存为"),
-                (12, "文字框选开关"),
                 (13, "翻译"),
                 (14, "识别二维码"),
                 (1, "矩形标注"),
@@ -3385,7 +3495,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 (25, "复制选中文字"),
                 (17, "直线标注"),
                 (18, "折线标注"),
-                (0, "框选 / 移动"),
+                (0, "框选 / 文字选择，再次点击切换"),
                 (21, "撤销"),
                 (22, "重做"),
                 (19, "精确尺寸"),
@@ -3395,7 +3505,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 AppendMenuW(
                     popup,
                     MF_STRING
-                        | if id == 12 && data.text_selection_enabled {
+                        | if id == 0 && data.tool == Tool::Select {
                             MF_CHECKED
                         } else {
                             0
@@ -3451,6 +3561,9 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
             return 0;
         }
         WM_KEYDOWN => {
+            if l & (1 << 30) != 0 && (w == 0x56 || w == 0x43 && GetKeyState(VK_SHIFT as i32) < 0) {
+                return 0;
+            }
             let ctrl = GetKeyState(VK_CONTROL as i32) < 0;
             let shift = GetKeyState(VK_SHIFT as i32) < 0;
             if data.long.is_some() {
@@ -3467,7 +3580,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 }
                 return 0;
             }
-            if data.text_selection_enabled {
+            if data.text_selection_enabled && data.tool == Tool::Select {
                 match w as u16 {
                     0x43 if ctrl && !data.text_selection.text.is_empty() => {
                         if !data.working
@@ -3521,16 +3634,8 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
                 VK_SPACE if data.screen.is_none() && !data.working => {
                     finish_polyline(data);
                     data.editing = !data.editing;
-                    data.tool = if data.editing {
-                        if data.group_tools[0] == 2 {
-                            Tool::Ellipse
-                        } else {
-                            toolbar::remember_tool(data, 1);
-                            Tool::Rect
-                        }
-                    } else {
-                        Tool::Select
-                    };
+                    data.tool = Tool::Select;
+                    data.text_selection = TextSelection::default();
                     toolbar::sync_pin(hwnd);
                     InvalidateRect(hwnd, null(), 0);
                     return 0;
@@ -3670,6 +3775,7 @@ unsafe extern "system" fn view_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPAR
         }
         WM_TIMER if w == 6 => {
             if data.text_selection_enabled
+                && data.tool == Tool::Select
                 && !data.recognition_pending
                 && !data.recognition_attempted
                 && !data.dragging
@@ -3998,6 +4104,261 @@ pub fn vertical_shift(previous: &RgbaImage, next: &RgbaImage) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn annotation_style_survives_new_views_and_process_style_reload() {
+        unsafe {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../artifacts")
+                .join(format!(
+                    "style-memory-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_nanos()
+                ));
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("settings.json"),r#"{"history_days":30,"color_format":"RGB","translation":{"provider":"test","endpoint":"https://example.com/api","model":"retained","api_key":"legacy-test-only"},"future_setting":{"keep":true}}"#).unwrap();
+            let mut state = App {
+                hwnd: null_mut(),
+                root: root.clone(),
+                settings: read_json(&root.join("settings.json")).unwrap(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let first = pin(
+                &mut state,
+                RgbaImage::new(200, 160),
+                None,
+                false,
+                Some([200, 200]),
+            )
+            .unwrap();
+            assert_eq!((*view(first)).stroke, 3);
+            command(first, 35).unwrap();
+            (*view(first)).stroke = 17;
+            persist_style(&*view(first)).unwrap();
+            command(first, 5).unwrap();
+            assert_eq!((*view(first)).color, toolbar::COLORS[5]);
+            command(first, 38).unwrap();
+            command(first, 1).unwrap();
+            assert_eq!(
+                (*view(first)).color,
+                toolbar::COLORS[5],
+                "leaving mosaic lost the remembered color"
+            );
+            DestroyWindow(first);
+            let saved: Settings = read_json(&root.join("settings.json")).unwrap();
+            assert_eq!(
+                (saved.annotation_color, saved.annotation_stroke),
+                (toolbar::COLORS[5], 17)
+            );
+            assert_eq!(saved.history_days, 30);
+            assert_eq!(saved.color_format, "RGB");
+            assert_eq!(saved.translation.model, "retained");
+            let document: serde_json::Value = read_json(&root.join("settings.json")).unwrap();
+            assert_eq!(document["future_setting"]["keep"], true);
+            assert_eq!(document["translation"]["api_key"], "legacy-test-only");
+            state.settings = saved;
+            let second = pin(
+                &mut state,
+                RgbaImage::new(240, 180),
+                None,
+                false,
+                Some([300, 200]),
+            )
+            .unwrap();
+            assert_eq!(
+                ((*view(second)).color, (*view(second)).stroke),
+                (toolbar::COLORS[5], 17)
+            );
+            DestroyWindow(second);
+            let mut next = empty_view(RgbaImage::new(240, 180));
+            next.screen = Some(RECT {
+                left: 0,
+                top: 0,
+                right: 240,
+                bottom: 180,
+            });
+            let capture = create_view(
+                &mut state,
+                next,
+                "private remembered capture",
+                RECT {
+                    left: 200,
+                    top: 200,
+                    right: 440,
+                    bottom: 380,
+                },
+                true,
+            );
+            assert_eq!(
+                ((*view(capture)).color, (*view(capture)).stroke),
+                (toolbar::COLORS[5], 17)
+            );
+            DestroyWindow(capture);
+            let invalid = Settings {
+                annotation_color: 0xffffffff,
+                annotation_stroke: -5,
+                ..Settings::default()
+            };
+            let mut fixture = empty_view(RgbaImage::new(16, 16));
+            apply_saved_style(&mut fixture, &invalid);
+            assert_eq!((fixture.color, fixture.stroke), (toolbar::COLORS[0], 1));
+        }
+    }
+
+    #[test]
+    fn toolbar_select_clicks_and_double_clicks_toggle_without_completing_capture() {
+        unsafe {
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let mut data = empty_view(RgbaImage::from_pixel(1000, 700, Rgba([245, 245, 245, 255])));
+            data.screen = Some(RECT {
+                left: 0,
+                top: 0,
+                right: 1000,
+                bottom: 700,
+            });
+            data.selection = RECT {
+                left: 100,
+                top: 100,
+                right: 800,
+                bottom: 450,
+            };
+            let hwnd = create_view(
+                &mut state,
+                data,
+                "private selection double-click regression",
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: 1000,
+                    bottom: 700,
+                },
+                true,
+            );
+            let data = &mut *view(hwnd);
+            let bar = toolbar::layout(hwnd, data);
+            let button = bar.buttons.iter().find(|(id, _)| *id == 0).unwrap().1;
+            let at = |x: i32, y: i32| ((x as u16 as usize) | ((y as u16 as usize) << 16)) as isize;
+            let p = at(
+                (button.left + button.right) / 2,
+                (button.top + button.bottom) / 2,
+            );
+            let sequence = GetClipboardSequenceNumber();
+            assert!(data.text_selection_enabled);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, p);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, p);
+            assert!(!data.text_selection_enabled);
+            assert_ne!(IsWindow(hwnd), 0);
+            SendMessageW(hwnd, WM_LBUTTONDBLCLK, 1, p);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, p);
+            assert!(data.text_selection_enabled);
+            assert_ne!(IsWindow(hwnd), 0);
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, p);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, p);
+            assert!(!data.text_selection_enabled);
+            assert_ne!(IsWindow(hwnd), 0);
+            assert_eq!(
+                GetClipboardSequenceNumber(),
+                sequence,
+                "toolbar click copied/finished the image"
+            );
+            command(hwnd, 12).unwrap();
+            data.recognition = Some(Recognition {
+                text: "Hello".into(),
+                words: vec![crate::ocr::Word {
+                    text: "Hello".into(),
+                    bounds: [40.0, 40.0, 80.0, 30.0],
+                }],
+                language: "en-US".into(),
+            });
+            data.recognition_origin = [100, 100];
+            data.recognition_pending = false;
+            assert!(text_hit(hwnd, data, [150, 150]));
+            command(hwnd, 1).unwrap();
+            assert!(data.text_selection_enabled);
+            assert!(!text_hit(hwnd, data, [150, 150]));
+            let marks = data.marks.len();
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(150, 150));
+            SendMessageW(hwnd, WM_MOUSEMOVE, 1, at(190, 165));
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, at(190, 165));
+            assert_eq!(data.marks.len(), marks + 1);
+            assert!(data.text_selection.text.is_empty());
+            DestroyWindow(hwnd);
+        }
+    }
+
+    #[test]
+    fn canvas_tool_keys_bypass_ime_but_inline_editor_keeps_input_context() {
+        unsafe {
+            let mut state = App {
+                hwnd: null_mut(),
+                root: PathBuf::new(),
+                settings: Settings::default(),
+                windows: HashSet::new(),
+                busy: false,
+                delayed: false,
+            };
+            let hwnd = pin(
+                &mut state,
+                RgbaImage::new(500, 300),
+                None,
+                false,
+                Some([200, 200]),
+            )
+            .unwrap();
+            let context = ImmGetContext(hwnd);
+            if !context.is_null() {
+                ImmReleaseContext(hwnd, context);
+            }
+            assert!(context.is_null(), "canvas retained an IME input context");
+            let scan = MapVirtualKeyW(0x52, MAPVK_VK_TO_VSC);
+            SendMessageW(
+                hwnd,
+                WM_KEYDOWN,
+                VK_PROCESSKEY as usize,
+                (scan << 16) as isize,
+            );
+            assert_eq!((*view(hwnd)).tool, Tool::Rect);
+            SendMessageW(hwnd, WM_KEYDOWN, 0x50, 0);
+            assert_eq!((*view(hwnd)).tool, Tool::Pen);
+            command(hwnd, 6).unwrap();
+            let data = &mut *view(hwnd);
+            text_editor::begin(hwnd, data, [40, 40]);
+            let edit = data.text_editor.as_ref().unwrap().hwnd;
+            let context = ImmGetContext(edit);
+            assert!(
+                !context.is_null(),
+                "inline editor did not restore IME input"
+            );
+            ImmReleaseContext(edit, context);
+            SendMessageW(edit, WM_IME_STARTCOMPOSITION, 0, 0);
+            for c in "中文R".encode_utf16() {
+                SendMessageW(edit, WM_CHAR, c as usize, 0);
+            }
+            SendMessageW(edit, WM_IME_ENDCOMPOSITION, 0, 0);
+            let mut text = [0u16; 32];
+            let len = GetWindowTextW(edit, text.as_mut_ptr(), 32);
+            assert_eq!(String::from_utf16_lossy(&text[..len as usize]), "中文R");
+            assert_eq!(
+                data.tool,
+                Tool::Text,
+                "typing in the editor selected a canvas tool"
+            );
+            text_editor::finish(hwnd, data, false);
+            DestroyWindow(hwnd);
+        }
+    }
+
     #[test]
     fn slow_detection_does_not_wait_and_stale_results_cannot_move_selection() {
         unsafe {
@@ -4673,6 +5034,7 @@ mod tests {
             assert!(!data.working);
             assert!(data.text_selection.text.is_empty());
             assert_eq!(data.marks.len(), marks);
+            SendMessageW(hwnd, WM_COMMAND, 0, 0);
             SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(141, 141));
             SendMessageW(hwnd, WM_MOUSEMOVE, 1, at(179, 159));
             assert_eq!(data.text_selection.text, "截图");
@@ -4686,14 +5048,14 @@ mod tests {
             ReleaseCapture();
             SendMessageW(hwnd, WM_CAPTURECHANGED, 0, 0);
             assert!(!data.dragging);
-            // The OCR switch coexists with the active rectangle tool.
+            // The legacy toggle now activates the combined selection tool.
             SendMessageW(hwnd, WM_COMMAND, 12, 0);
             assert!(!data.text_selection_enabled);
-            assert_eq!(data.tool, Tool::Rect);
+            assert_eq!(data.tool, Tool::Select);
             assert!(data.text_selection.text.is_empty());
             SendMessageW(hwnd, WM_COMMAND, 12, 0);
             assert!(data.text_selection_enabled);
-            assert_eq!(data.tool, Tool::Rect);
+            assert_eq!(data.tool, Tool::Select);
             assert!(text_hit(hwnd, &data, [141, 141]));
             data.start = [141, 141];
             select_text(hwnd, &mut data, [179, 159]);
@@ -4704,7 +5066,6 @@ mod tests {
                 });
                 frame.save(root.join("capture-text-selection.png")).unwrap();
             }
-            SendMessageW(hwnd, WM_COMMAND, 0, 0);
             assert!(!contains(toolbar::layout(hwnd, &data).bounds, [120, 120]));
             SendMessageW(hwnd, WM_LBUTTONDOWN, 1, at(120, 120));
             assert!(
@@ -4840,7 +5201,7 @@ mod tests {
             assert_eq!(data.tool, Tool::Select);
             SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE as usize, 0);
             assert!(data.editing);
-            assert_eq!(data.tool, Tool::Ellipse);
+            assert_eq!(data.tool, Tool::Select);
             assert_eq!(data.group_tools[0], 2);
             assert!(data.text_selection_enabled);
             if let Some(root) = &evidence {

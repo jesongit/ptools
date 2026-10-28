@@ -63,7 +63,7 @@ public static class CaptureMotionWin {
       SendInput(2,release,Marshal.SizeOf<INPUT>());throw new Exception("Capture hotkey injection failed");
     }
   }
-  public static string VerifyToolbar(IntPtr h,uint process,int selectionBottom) {
+  public static string VerifyToolbar(IntPtr h,uint process,int selectionBottom,int originalStroke) {
     int dpi=(int)GetDpiForWindow(h);Func<int,int> s=v=>(v*dpi+48)/96;
     GetWindowRect(h,out RECT bounds);GetCursorPos(out POINT cursor);
     int width=s(32)*11+s(6)*2;
@@ -89,7 +89,18 @@ public static class CaptureMotionWin {
       UpdateWindow(h);
       if(IsWindowVisible(hint)) throw new Exception("Daily hint survived the tool switch");
       if(GetPixel(dc,colorX,colorY)==0x0048e8) throw new Exception("Move tool still renders the color palette");
-      return "passed: daily brush palette, captured slider drag/clamp, cursor hint and move-tool hiding";
+      // Slider choices now persist; restore the caller's original preference before closing.
+      if(SendRaw(h,0x111,new IntPtr(4),IntPtr.Zero,2,5000,out result)==IntPtr.Zero) throw new Exception("Cannot restore brush preference");
+      int restoreX=railLeft+((Math.Clamp(originalStroke,1,32)-1)*(railRight-railLeft)+15)/31;
+      Send(h,0x201,restoreX,colorY,1);Send(h,0x202,restoreX,colorY);
+      SendRaw(h,0x111,IntPtr.Zero,IntPtr.Zero,2,5000,out result);
+      int selectTop=selectionBottom+s(6);
+      if(selectTop+s(76)>bounds.Bottom-bounds.Top) selectTop=200-s(76)-s(6);
+      int selectX=left+s(6)+s(16),selectY=selectTop+s(6)+s(16);
+      Send(h,0x201,selectX,selectY,1);Send(h,0x202,selectX,selectY);
+      Send(h,0x203,selectX,selectY,1);Send(h,0x202,selectX,selectY);
+      if(!IsWindow(h)) throw new Exception("Repeated first-tool clicks closed the daily capture");
+      return "passed: brush palette, captured slider drag/clamp, cursor hint, move-tool hiding, restored stroke and first-tool double-click keeps capture open";
     } finally {if(dc!=IntPtr.Zero) ReleaseDC(h,dc);SetCursorPos(cursor.X,cursor.Y);}
   }
   public static double[][] Measure(IntPtr h) {
@@ -144,14 +155,16 @@ try {
             $toolbarResult='not requested'
             if($CheckToolbar) {
                 $selectionBottom=864
+                $originalStroke=3
                 if($Daily) {
                     $captureSettingsPath=Join-Path $projectRoot 'run/data/plugin-data/capture/settings.json'
                     if(Test-Path -LiteralPath $captureSettingsPath) {
                         $captureSettings=Get-Content -LiteralPath $captureSettingsPath -Raw | ConvertFrom-Json
+                        if($null -ne $captureSettings.annotation_stroke) {$originalStroke=[Math]::Clamp([int]$captureSettings.annotation_stroke,1,32)}
                         if($captureSettings.fixed_ratio) { $selectionBottom=[Math]::Min($r.Bottom-$r.Top,200+[int][Math]::Floor(1128*$captureSettings.fixed_ratio[1]/$captureSettings.fixed_ratio[0])) }
                     }
                 }
-                $toolbarResult=[CaptureMotionWin]::VerifyToolbar($window,$process.Id,$selectionBottom)
+                $toolbarResult=[CaptureMotionWin]::VerifyToolbar($window,$process.Id,$selectionBottom,$originalStroke)
             }
             $reports+=@{label=$candidate.label;daily=[bool]$Daily;toolbar=$toolbarResult;executable=$resolved;sha256=(Get-FileHash -LiteralPath $resolved).Hash;
                 size=@(($r.Right-$r.Left),($r.Bottom-$r.Top));frames=$samples[0].Length;

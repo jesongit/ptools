@@ -7,7 +7,7 @@ $runRoot=Join-Path $projectRoot ('artifacts/capture-groups-' + (Get-Date -Format
 $dataRoot=Join-Path $runRoot 'data'
 $images=Join-Path $dataRoot 'images'
 New-Item -ItemType Directory -Path $images -Force | Out-Null
-$results=[ordered]@{timestamp=(Get-Date).ToString('o');executable=$Executable;binary_sha256=(Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash;data_dir=$dataRoot;status='running';checks=@();clipboard_restored=$null;input='Native mouse messages and actual native popup mouse choices; SendInput for menu, Space and copy keys; bounded WM_KEYDOWN/UP for letter shortcut handling; private fixture';clipboard_read='Native CF_UNICODETEXT and immediate CF_DIBV5; original formats restored through materialized snapshot';overlay_ocr='Real capture of our rendered private pin; grouped tools in both surfaces';limits=@('Current monitor DPI is exercised; cross-monitor DPI changes are not exercised','Letter shortcuts are delivered directly to the private window because WeType intercepted a real R key during verification; physical letter shortcuts under Chinese IME are not verified')}
+$results=[ordered]@{timestamp=(Get-Date).ToString('o');executable=$Executable;binary_sha256=(Get-FileHash -LiteralPath $Executable -Algorithm SHA256).Hash;data_dir=$dataRoot;status='running';checks=@();clipboard_restored=$null;input='Native mouse messages and actual native popup mouse choices; SendInput for menu, Space, copy and Chinese-layout R/P/T keys; bounded WM_KEYDOWN/UP for remaining shortcut handling; private fixture';clipboard_read='Native CF_UNICODETEXT and immediate CF_DIBV5; original formats restored through materialized snapshot';overlay_ocr='Real capture of our rendered private pin; grouped tools in both surfaces';limits=@('Current monitor DPI is exercised; cross-monitor DPI changes are not exercised','Chinese input layout R/P/T use real injected keys; other layouts and third-party IME versions are not exhaustively exercised')}
 $gui=$null; $overlayGui=$null; $clipboardWindow=$null; $clipboardReady=$false; $clipboardTouched=$false; $originalForeground=[IntPtr]::Zero; $originalDpi=[IntPtr]::Zero; $originalCursor=$null
 $clipboardCopies=[Collections.Generic.List[IDisposable]]::new()
 function Check([bool]$Ok,[string]$Name,[object]$Evidence=$null) {
@@ -46,6 +46,11 @@ public static class CaptureGroupsWin {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
   [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] static extern IntPtr GetKeyboardLayout(uint thread);
+  [DllImport("user32.dll")] static extern int GetKeyboardLayoutList(int count,[Out] IntPtr[] values);
+  public static IntPtr Layout(IntPtr h) {return GetKeyboardLayout(GetWindowThreadProcessId(h,out uint pid));}
+  public static IntPtr ChineseLayout() {var values=new IntPtr[GetKeyboardLayoutList(0,null)];GetKeyboardLayoutList(values.Length,values);foreach(var value in values) if((value.ToInt64()&0xffff)==0x0804) return value;return IntPtr.Zero;}
+
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
   [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
@@ -285,7 +290,7 @@ function Drag-Image([double]$X1,[double]$Y1,[double]$X2,[double]$Y2) {
 }
 # These are the expected public toolbar actions. Ink checks exercise rendered icons;
 # clicks on selection/copy/mosaic exercise the native hit targets as well.
-$toolbarItems=@(0,1,3,4,6,7,21,22,12,25,13,14,24,15,19,20,16,10,11,101,100,9)
+$toolbarItems=@(0,1,3,4,6,7,21,22,25,13,14,24,15,19,20,16,10,11,101,100,9)
 function Toolbar-Geometry {
     $r=Client-Rect $script:toolbar
     $scale=[Math]::Max(96,[int][CaptureGroupsWin]::GetDpiForWindow($script:toolbar))
@@ -308,7 +313,7 @@ function Toolbar-Geometry {
 }
 function Toolbar-Click([int]$Id) {
     $g=Toolbar-Geometry
-    if($Id -eq 38) { $x=$g.pad+(8%$g.style_columns)*$g.style+[int]($g.style/2); $y=$g.pad+$g.rows*$g.cell+[int][Math]::Floor((4*$g.scale+48)/96)+[int][Math]::Floor(8/$g.style_columns)*[int][Math]::Floor((22*$g.scale+48)/96)+[int]($g.style/2) }
+    if($Id -ge 30 -and $Id -le 38) { $color=$Id-30; $x=$g.pad+($color%$g.style_columns)*$g.style+[int]($g.style/2); $y=$g.pad+$g.rows*$g.cell+[int][Math]::Floor((4*$g.scale+48)/96)+[int][Math]::Floor($color/$g.style_columns)*[int][Math]::Floor((22*$g.scale+48)/96)+[int]($g.style/2) }
     else {
         $i=[Array]::IndexOf($toolbarItems,$Id)
         if($i -lt 0) { throw "Unknown toolbar item $Id" }
@@ -564,15 +569,32 @@ try {
     Wait-Ocr $dataRoot; Key 0x20
     Wait-For { $script:toolbar=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.toolbar'))[0]; $null -ne $toolbar } 'floating pin toolbar'
     Snapshot $toolbar 'pin-toolbar-initial.png'
-    Check ($toolbarItems.Count -eq 22) 'Main toolbar contains 22 actions after merging 7 drawing tools into 3 groups'
+    $chineseLayout=[CaptureGroupsWin]::ChineseLayout()
+    if($chineseLayout -ne [IntPtr]::Zero) {
+        [void][CaptureGroupsWin]::PostMessage($pin,0x0050,[IntPtr]::Zero,$chineseLayout)
+        Wait-For { [CaptureGroupsWin]::Layout($pin) -eq $chineseLayout } 'Chinese keyboard layout on private capture thread'
+        $results.ime_keyboard_layout='0x'+$chineseLayout.ToInt64().ToString('x')
+        Key 0x52; Snapshot $toolbar 'ime-rectangle.png'
+        Check ((Toolbar-Fill 'ime-rectangle.png' 1) -ne (Toolbar-Fill 'ime-rectangle.png' 0)) 'Real R key selects rectangle with the Chinese input layout active'
+        Key 0x50; Snapshot $toolbar 'ime-pen.png'
+        Check ((Toolbar-Fill 'ime-pen.png' 4) -ne (Toolbar-Fill 'ime-pen.png' 0)) 'Real P key selects pen with the Chinese input layout active'
+        Key 0x54; Snapshot $toolbar 'ime-text.png'
+        Check ((Toolbar-Fill 'ime-text.png' 6) -ne (Toolbar-Fill 'ime-text.png' 0)) 'Real T key selects text tool with the Chinese input layout active'
+        Key 0x56
+    } else { $results.ime_keyboard_layout='Chinese input layout not installed; real-key IME checks not run' }
+
+    Check ($toolbarItems.Count -eq 21) 'Main toolbar contains 21 actions with text selection merged into the first tool'
     $g=Toolbar-Geometry
     Check ($g.width -le (Client-Rect $toolbar).Right -and $g.height -le (Client-Rect $toolbar).Bottom) 'Floating toolbar geometry fits every main and style action'
-    Check ((Toolbar-Fill 'pin-toolbar-initial.png' 12) -eq (Toolbar-Fill 'pin-toolbar-initial.png' 1)) 'OCR switch remains independently highlighted with the initial shape tool'
+    Check ((Toolbar-Fill 'pin-toolbar-initial.png' 0) -ne (Toolbar-Fill 'pin-toolbar-initial.png' 1)) 'Pin editing starts with the combined text-selection tool active'
     [void][CaptureGroupsWin]::Send($pin,0x0111,0)
     $compact=Client-Rect $toolbar; $g=Toolbar-Geometry
-    Check ($g.columns -eq 11 -and $g.rows -eq 2) 'Compact pin toolbar keeps all 22 actions in two short rows'
+    Check ($g.columns -eq 11 -and $g.rows -eq 2) 'Compact pin toolbar keeps all 21 actions in two short rows'
     Check ($compact.Bottom -eq 2*$g.pad+2*$g.cell) 'Move tool hides color palette, width slider and the former status row'
     Snapshot $toolbar 'pin-toolbar-select-compact.png'
+    [void][CaptureGroupsWin]::Send($pin,0x0111,0)
+    Snapshot $toolbar 'pin-toolbar-text-selection-on.png'
+    Check ((Tool-Ink 'pin-toolbar-select-compact.png' 0) -ne (Tool-Ink 'pin-toolbar-text-selection-on.png' 0)) 'Clicking the selected first tool switches between pointer and text-cursor icons'
     [void][CaptureGroupsWin]::Send($pin,0x0111,4)
     $g=Toolbar-Geometry; $styled=Client-Rect $toolbar
     Check ($styled.Bottom -gt $compact.Bottom) 'Brush tool reveals its contextual color palette and slider'
@@ -612,7 +634,7 @@ try {
             $rows=@(Group-Open $group ($name+'-choose')); Menu-Choose $index ($index -eq 0)
             Group-Main $group $name; Snapshot $toolbar ($name+'-toolbar.png')
             $signatures[$id]=Tool-Ink ($name+'-toolbar.png') $group.anchor
-            Check ((Toolbar-Fill ($name+'-toolbar.png') 12) -eq (Toolbar-Fill ($name+'-toolbar.png') $group.anchor)) ($name+' grouped tool and OCR switch are highlighted together')
+            Check ((Toolbar-Fill ($name+'-toolbar.png') 0) -ne (Toolbar-Fill ($name+'-toolbar.png') $group.anchor)) ($name+' drawing tool is active independently of the selection tool')
             Copy-PinImage ($name+'-before.png')
             $r=Client-Rect $pin; Draw-Member $id $pin @(2,2) (($r.Right-4)/960) (($r.Bottom-4)/420)
             Copy-PinImage ($name+'-drawn.png')
@@ -624,8 +646,13 @@ try {
             Shortcut 0x56; Group-Main $group ($name+'-reactivate')
             Snapshot $toolbar ($name+'-reactivated-toolbar.png')
             Check ((Tool-Ink ($name+'-toolbar.png') $group.anchor) -eq (Tool-Ink ($name+'-reactivated-toolbar.png') $group.anchor)) ($name+' main button retains the selected icon after switching tools')
+            Set-Sentinel
+            Drag-Image ($box[0]+2) $wordY ($box[0]+$box[2]-2) $wordY
+            Check ((Clipboard-Text) -eq $sentinel) ($name+' draws across text instead of selecting or copying it')
+            [void][CaptureGroupsWin]::Send($pin,0x0111,21)
+            Shortcut 0x56
             Wait-Ocr $dataRoot
-            Verify-Copy ($name+' still selects recognized image text') 'Hello' { Drag-Image ($box[0]+2) $wordY ($box[0]+$box[2]-2) $wordY }
+            Verify-Copy ($name+' can select text after returning to the first tool') 'Hello' { Drag-Image ($box[0]+2) $wordY ($box[0]+$box[2]-2) $wordY }
         }
         Check (@($signatures.Values | Select-Object -Unique).Count -eq $group.ids.Count) ('Group '+$group.anchor+' displays a different main icon for every member')
         for($index=0;$index -lt $group.ids.Count;$index++) {
@@ -649,7 +676,7 @@ try {
     $rows=@(Group-Open $groups[0] 'pin-after-outside-cancel'); Group-Checked $rows 2 'Outside cancellation preserves the remembered ellipse choice'; Menu-Cancel
     Shortcut 0x50
     Toolbar-Click 38; Snapshot $toolbar 'pin-mosaic-toolbar.png'
-    Check ((Toolbar-Fill 'pin-mosaic-toolbar.png' 12) -eq (Toolbar-Fill 'pin-mosaic-toolbar.png' 4)) 'Mosaic stays in the style palette while its brush group and the OCR switch remain highlighted'
+    Check ((Toolbar-Fill 'pin-mosaic-toolbar.png' 0) -ne (Toolbar-Fill 'pin-mosaic-toolbar.png' 4)) 'Mosaic stays in the brush palette without activating text selection'
 
     # Capture only the generated private fixture; dropdown interaction in a real
     # screenshot must use the same split buttons as the floating pin toolbar.
@@ -668,6 +695,14 @@ try {
     Wait-Ocr $overlayData; $originalPin=$pin; $script:pin=$overlay; $script:toolbar=$overlay; $script:activePid=$overlayGui.Id
     $script:toolbarAnchor=[CaptureGroupsWin+RECT]::new(); $toolbarAnchor.Left=$cropX; $toolbarAnchor.Top=$cropY; $toolbarAnchor.Right=$cropX+$cropWidth; $toolbarAnchor.Bottom=$cropY+$cropHeight
     Snapshot $overlay 'capture-toolbar-initial.png'
+    $point=Toolbar-Point 0
+    $sequence=[CaptureGroupsWin]::GetClipboardSequenceNumber()
+    Mouse-Point $overlay 0x0201 $point[0] $point[1] 1;Mouse-Point $overlay 0x0202 $point[0] $point[1]
+    Check ([CaptureGroupsWin]::IsWindow($overlay)) 'First selection-tool click keeps the screenshot alive'
+    Mouse-Point $overlay 0x0203 $point[0] $point[1] 1;Mouse-Point $overlay 0x0202 $point[0] $point[1]
+    Check ([CaptureGroupsWin]::IsWindow($overlay)) 'Double-click message on the selection icon does not complete or close the screenshot'
+    Check ([CaptureGroupsWin]::GetClipboardSequenceNumber() -eq $sequence) 'Selection icon repeated clicks never copy the screenshot'
+
     foreach($group in $groups) {
         for($index=0;$index -lt $group.ids.Count;$index++) {
             $id=$group.ids[$index]; $name='capture-'+$id
@@ -683,18 +718,46 @@ try {
     }
     $rows=@(Group-Open $groups[0] 'capture-escape'); Menu-Cancel
     Check ([CaptureGroupsWin]::IsWindow($overlay)) 'Escape from screenshot dropdown preserves the screenshot window'
-    [void][CaptureGroupsWin]::Send($overlay,0x0111,1); Set-Sentinel; Wait-Ocr $overlayData
+    [void][CaptureGroupsWin]::Send($overlay,0x0111,0); Set-Sentinel; Wait-Ocr $overlayData
     $screenLeft=[int][Math]::Round($cropX+($box[0]+2)*$cropWidth/960); $screenRight=[int][Math]::Round($cropX+($box[0]+$box[2]-2)*$cropWidth/960); $screenY=[int][Math]::Round($cropY+$wordY*$cropHeight/420)
     Mouse-Point $overlay 0x0201 $screenLeft $screenY 1; Mouse-Point $overlay 0x0200 $screenRight $screenY 1; Mouse-Point $overlay 0x0202 $screenRight $screenY
     Wait-For { (Clipboard-Text) -eq 'Hello' } 'Screenshot OCR remains selectable with a grouped shape tool' 5000
-    Check $true 'Screenshot OCR stays independent of grouped drawing tools'
+    Check $true 'Screenshot OCR works after returning to the combined selection tool'
     [void][CaptureGroupsWin]::Send($overlay,0x0111,9)
     Wait-For { [CaptureGroupsWin]::IsClipboardFormatAvailable(17) } 'complete screenshot copies a real image' 5000
     $captured=Clipboard-Image
     try { Check ($captured.Width -eq $cropWidth -and $captured.Height -eq $cropHeight) 'Screenshot export preserves region dimensions after grouped tool use'; $captured.Save((Join-Path $runRoot 'capture-export.png'),[Drawing.Imaging.ImageFormat]::Png) } finally { $captured.Dispose() }
     Check ($overlayGui.WaitForExit(5000)) 'Completing the private screenshot exits its process'; $overlayGui.Dispose(); $overlayGui=$null
+    $script:pin=$originalPin; $script:toolbar=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.toolbar'))[0]; $script:toolbarAnchor=$null; $script:activePid=$gui.Id
+    [void][CaptureGroupsWin]::Send($pin,0x0111,4)
+    Toolbar-Click 34
+    [void][CaptureGroupsWin]::Send($pin,0x0111,42)
+    $savedStyle=Get-Content -LiteralPath (Join-Path $dataRoot 'settings.json') -Raw | ConvertFrom-Json
+    Check ($savedStyle.annotation_color -eq 0xeb8b28 -and $savedStyle.annotation_stroke -eq 6) 'Color and stroke choices are saved before the plugin exits'
     [void][CaptureGroupsWin]::PostMessage($originalPin,0x0010,[IntPtr]::Zero,[IntPtr]::Zero); [void][CaptureGroupsWin]::PostMessage($history,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
-    Check ($gui.WaitForExit(5000)) 'Closing private pin and history exits the verification process'; $results.status='passed'
+    Check ($gui.WaitForExit(5000)) 'Closing private pin and history exits the verification process'
+    $gui.Dispose()
+    $gui=Start-Process -FilePath $Executable -ArgumentList @('--action','history','--data-dir',('"'+$dataRoot+'"')) -WindowStyle Hidden -PassThru
+    $script:activePid=$gui.Id
+    Wait-For { $script:history=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.view'))[0]; $null -ne $history -and [CaptureGroupsWin]::GetDlgItem($history,1) -ne [IntPtr]::Zero } 'restarted private history'
+    [void][CaptureGroupsWin]::Send($history,0x0111,(1 -bor (2 -shl 16)))
+    Wait-For { $script:pin=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.view') | Where-Object {$_ -ne $history})[0];$null -ne $pin } 'pin in new plugin process'
+    Key 0x20
+    Wait-For { $script:toolbar=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.toolbar'))[0];$null -ne $toolbar } 'restarted toolbar'
+    [void][CaptureGroupsWin]::Send($pin,0x0111,4)
+    Snapshot $toolbar 'restarted-style.png'
+    $g=Toolbar-Geometry;$step={param($v)[int][Math]::Floor(($v*$g.scale+48)/96)}
+    $image=[Drawing.Bitmap]::new((Join-Path $runRoot 'restarted-style.png'))
+    try {$selected=$image.GetPixel(($g.pad+4*$g.style+(& $step 3)),($g.pad+$g.rows*$g.cell+(& $step 7))).ToArgb()} finally {$image.Dispose()}
+    Check ($selected -eq (Toolbar-Fill 'restarted-style.png' 4)) 'A new pin restores the selected color after plugin process restart'
+    $sliderLeft=$g.pad+9*$g.style+(& $step 8);$railLeft=$sliderLeft+(& $step 44);$railRight=$g.width-$g.pad-(& $step 6);$sliderY=$g.pad+$g.rows*$g.cell+(& $step 14)
+    $r=Window-Rect $toolbar;[void][CaptureGroupsWin]::SetCursorPos(($r.Left+[int](($railLeft+$railRight)/2)),($r.Top+$sliderY))
+    Mouse-Point $toolbar 0x0200 ([int](($railLeft+$railRight)/2)) $sliderY
+    Wait-For {$script:hint=@([CaptureGroupsWin]::Windows($gui.Id,'ptools.capture.tooltip'))[0];$null -ne $hint} 'restored stroke tooltip'
+    Check (([CaptureGroupsWin]::Describe($hint)) -like '*6 px*') 'A new pin restores the saved stroke after plugin process restart'
+    [void][CaptureGroupsWin]::PostMessage($pin,0x0010,[IntPtr]::Zero,[IntPtr]::Zero);[void][CaptureGroupsWin]::PostMessage($history,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
+    Check ($gui.WaitForExit(5000)) 'Restarted verification plugin closes all windows and exits'
+; $results.status='passed'
 } catch {
     $results.status='failed'; $results.error=$_.Exception.Message
     $results.clipboard_owner_at_failure=[CaptureGroupsWin]::Describe([CaptureGroupsWin]::GetClipboardOwner())

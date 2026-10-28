@@ -1,6 +1,7 @@
 use super::*;
 use windows_sys::Win32::UI::Input::Ime::{
-    CPS_CANCEL, CPS_COMPLETE, ImmGetContext, ImmNotifyIME, ImmReleaseContext, NI_COMPOSITIONSTR,
+    CPS_CANCEL, CPS_COMPLETE, IACE_DEFAULT, ImmAssociateContextEx, ImmGetContext, ImmNotifyIME,
+    ImmReleaseContext, NI_COMPOSITIONSTR,
 };
 
 pub(super) struct Editor {
@@ -32,6 +33,7 @@ pub(super) unsafe fn begin(hwnd: HWND, data: &mut View, p: [i32; 2]) {
     if edit.is_null() {
         return;
     }
+    ImmAssociateContextEx(edit, null_mut(), IACE_DEFAULT);
     let point = image_point(hwnd, data, p);
     let mut client = RECT::default();
     GetClientRect(hwnd, &mut client);

@@ -6,8 +6,8 @@ pub(super) const COLORS: [u32; 8] = [
 ];
 // The high byte distinguishes the mosaic brush from every valid RGB color.
 pub(super) const MOSAIC_COLOR: u32 = 0x01000000;
-const ITEMS: [usize; 22] = [
-    0, 1, 3, 4, 6, 7, 21, 22, 12, 25, 13, 14, 24, 15, 19, 20, 16, 10, 11, 101, 100, 9,
+const ITEMS: [usize; 21] = [
+    0, 1, 3, 4, 6, 7, 21, 22, 25, 13, 14, 24, 15, 19, 20, 16, 10, 11, 101, 100, 9,
 ];
 pub(super) const SLIDER: usize = 43;
 const MAX_STROKE: i32 = 32;
@@ -250,7 +250,11 @@ pub(super) fn enabled(data: &View, id: usize) -> bool {
         13 => !data.recognition_pending && (data.screen.is_none() || visible(data)),
         15 => data.screen.is_some() && visible(data),
         19 | 20 => data.screen.is_some(),
-        25 => data.text_selection_enabled && !data.text_selection.text.is_empty(),
+        25 => {
+            data.tool == Tool::Select
+                && data.text_selection_enabled
+                && !data.text_selection.text.is_empty()
+        }
         101 => data.file.is_some(),
         1..=11 | 14 | 17 | 18 | 24 => data.screen.is_none() || visible(data),
         _ => true,
@@ -314,7 +318,6 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
     SelectObject(dc, if font.is_null() { data.font } else { font });
     for &(id, r) in &layout.buttons {
         let active = active_tool(data, id)
-            || id == 12 && data.text_selection_enabled
             || (30..=37).contains(&id) && COLORS[id - 30] == data.color
             || id == 38 && data.tool == Tool::Pen && data.color == MOSAIC_COLOR;
         let available = enabled(data, id);
@@ -367,8 +370,8 @@ pub(super) unsafe fn draw(dc: HDC, data: &View, layout: &Layout) {
             DeleteObject(brush);
         } else if id == 38 {
             mosaic_swatch(dc, r, active, layout.scale);
-        } else if id == 12 {
-            text_switch(dc, r, data.text_selection_enabled, layout.scale * 5 / 6);
+        } else if id == 0 && data.text_selection_enabled {
+            text_select_icon(dc, r, color, layout.scale * 5 / 6);
         } else {
             if group_index(id).is_some() {
                 let arrow = layout.arrow_rect(r);
@@ -435,15 +438,15 @@ pub(super) fn hint_text(data: &View, id: usize) -> String {
         return format!("{name}：{value} px · 拖动调整");
     }
     let id = displayed_tool(data, id);
-    let text = if id == 12 {
+    let text = if id == 0 {
         if !data.text_selection_enabled {
-            "文字框选已关闭 · Shift+C开启"
+            "普通框选 / 移动 · 再次点击开启文字选择 · V"
         } else if data.recognition_pending {
-            "文字框选已开启 · 后台识别中…"
+            "文字框选 · 后台识别中… · 再次点击切换普通框选"
         } else if data.recognition_error.is_some() {
-            "文字识别不可用 · 关闭后重新开启可重试"
+            "文字识别不可用 · 再次点击关闭后可重新开启"
         } else {
-            "文字框选已开启 · 文字上拖选，空白处移动或绘制"
+            "文字框选 / 移动 · 文字上拖选 · 再次点击关闭 · V"
         }
     } else if id == 9 && !data.text_selection.text.is_empty() {
         if data.screen.is_none() {
@@ -493,31 +496,26 @@ unsafe fn dropdown_arrow(dc: HDC, r: RECT, color: u32, dpi: i32) {
     DeleteObject(pen);
     DeleteObject(brush);
 }
-unsafe fn text_switch(dc: HDC, r: RECT, checked: bool, dpi: i32) {
+unsafe fn text_select_icon(dc: HDC, r: RECT, color: u32, dpi: i32) {
     let s = |v: i32| (v * dpi + 48) / 96;
-    let x = (r.left + r.right) / 2;
-    let y = (r.top + r.bottom) / 2;
-    let pen = CreatePen(
-        PS_SOLID,
-        s(1).max(1),
-        if checked { theme::ACCENT } else { theme::MUTED },
-    );
-    let brush = CreateSolidBrush(if checked {
-        theme::ACCENT
-    } else {
-        theme::BORDER
-    });
+    let x = (r.left + r.right) / 2 - s(12);
+    let y = (r.top + r.bottom) / 2 - s(12);
+    let pen = CreatePen(PS_SOLID, s(2).max(1), color);
     let old_pen = SelectObject(dc, pen);
-    let old_brush = SelectObject(dc, brush);
-    RoundRect(dc, x - s(12), y - s(6), x + s(12), y + s(6), s(12), s(12));
-    let thumb = CreateSolidBrush(theme::TEXT);
-    SelectObject(dc, thumb);
-    let cx = x + if checked { s(6) } else { -s(6) };
-    Ellipse(dc, cx - s(4), y - s(4), cx + s(4), y + s(4));
+    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, x + s(2), y + s(4), x + s(17), y + s(19));
+    for (a, b) in [
+        ([5, 8], [12, 8]),
+        ([5, 12], [10, 12]),
+        ([14, 10], [22, 10]),
+        ([18, 10], [18, 23]),
+        ([14, 23], [22, 23]),
+    ] {
+        MoveToEx(dc, x + s(a[0]), y + s(a[1]), null_mut());
+        LineTo(dc, x + s(b[0]), y + s(b[1]));
+    }
     SelectObject(dc, old_brush);
     SelectObject(dc, old_pen);
-    DeleteObject(thumb);
-    DeleteObject(brush);
     DeleteObject(pen);
 }
 unsafe fn mosaic_swatch(dc: HDC, r: RECT, active: bool, dpi: i32) {
@@ -915,6 +913,9 @@ pub(super) unsafe fn drag_slider(owner: HWND, source: HWND, p: [i32; 2], finish:
     if finish {
         data.slider_window = null_mut();
         ReleaseCapture();
+        if let Err(error) = persist_style(data) {
+            alert(owner, &error);
+        }
     }
     true
 }
@@ -1136,7 +1137,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         view(owner)
     };
     if !ptr.is_null() {
-        if msg == WM_LBUTTONDOWN {
+        if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK {
             if let Err(e) = click(owner, hwnd, point(l)) {
                 alert(owner, &e);
             }
@@ -1179,6 +1180,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
             WM_CAPTURECHANGED => {
                 if data.slider_window == hwnd {
                     data.slider_window = null_mut();
+                    if let Err(error) = persist_style(data) {
+                        alert(owner, &error);
+                    }
                 }
             }
             WM_MOUSEHOVER => {
@@ -1220,7 +1224,7 @@ mod tests {
     fn compact_tools_only_show_relevant_style_controls() {
         for tool in [Tool::Select, Tool::PickColor] {
             let bar = Layout::new(1920, 1080, 96, None, tool);
-            assert_eq!(bar.buttons.len(), 22);
+            assert_eq!(bar.buttons.len(), 21);
             assert!(bar.slider.is_none());
             assert_eq!([bar.bounds.right, bar.bounds.bottom], [364, 76]);
             assert_eq!(bar.buttons.iter().filter(|(_, r)| r.top == 6).count(), 11);
@@ -1370,12 +1374,14 @@ mod tests {
         for dpi in [96, 144, 192] {
             for (name, tool) in [
                 ("select", Tool::Select),
+                ("move", Tool::Select),
                 ("pen", Tool::Pen),
                 ("text", Tool::Text),
                 ("mosaic", Tool::Pen),
                 ("highlight", Tool::Highlight),
             ] {
                 data.tool = tool;
+                data.text_selection_enabled = name != "move";
                 data.color = if name == "mosaic" {
                     MOSAIC_COLOR
                 } else {
@@ -1434,9 +1440,13 @@ mod tests {
     fn toolbar_exposes_recognition_and_screen_actions_without_a_more_menu() {
         let layout = Layout::new(800, 600, 144, None, Tool::Pen);
         let ids: Vec<_> = layout.buttons.iter().map(|&(id, _)| id).collect();
-        for id in [12, 13, 14, 15, 16, 19, 20, 24, 25, 38, 101] {
+        for id in [0, 13, 14, 15, 16, 19, 20, 24, 25, 38, 101] {
             assert!(ids.contains(&id), "missing action {id}");
         }
+        assert!(
+            !ids.contains(&12),
+            "text selection is merged into the first tool"
+        );
         assert!(!ids.contains(&8), "mosaic is a brush style");
         assert!(!ids.contains(&23), "all actions have their own icon");
         assert!(
@@ -1513,7 +1523,7 @@ mod tests {
             .take(ITEMS.len())
             .map(|&(id, _)| id)
             .collect();
-        assert_eq!(ids.len(), 22);
+        assert_eq!(ids.len(), 21);
         for id in [2, 17, 18, 5] {
             assert!(!ids.contains(&id));
         }
